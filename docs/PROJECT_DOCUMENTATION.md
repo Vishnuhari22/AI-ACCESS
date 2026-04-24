@@ -2,7 +2,7 @@
 
 > **Universal Intelligent Accessibility Agent**  
 > AI-Powered Accessibility Middleware for Smart Kiosks  
-> TCS iON Internship Project — April 2026
+> April 2026
 
 ---
 

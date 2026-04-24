@@ -1,7 +1,7 @@
-# 🦾 UIAA — Universal Intelligent Accessibility Agent
+# UIAA — Universal Intelligent Accessibility Agent
 
 > **AI-Powered Accessibility Middleware for Smart Kiosks**  
-> *TCS iON Internship Project — April 2026*
+> *April 2026*
 
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)](https://python.org)
 [![Gemini API](https://img.shields.io/badge/Gemini-AI%20Studio-4285F4?logo=google&logoColor=white)](https://aistudio.google.com)
@@ -10,15 +10,15 @@
 
 ---
 
-## 📋 Overview
+## Overview
 
 UIAA is an AI agent that makes **any** self-service kiosk (ATM, hospital token machine, government portal) accessible to **every** user — including those with visual impairments, motor disabilities, cognitive challenges, or language barriers.
 
 Instead of requiring kiosk vendors to redesign their software, UIAA sits as an **intelligent middleware layer** that:
-- 🎤 **Listens** — understands voice commands in English, Hindi, and Tamil
-- 👁️ **Sees** — uses computer vision to detect user disabilities (squinting, tremor, wheelchair)
-- 🧠 **Reasons** — an LLM orchestrator decides how to adapt the interface
-- ✋ **Acts** — injects clicks, changes fonts/contrast, simplifies layouts in real time
+- **Listens** — understands voice commands in English, Hindi, and Tamil
+- **Sees** — uses computer vision to detect user disabilities (squinting, tremor, wheelchair)
+- **Reasons** — an LLM orchestrator decides how to adapt the interface
+- **Acts** — injects clicks, changes fonts/contrast, simplifies layouts in real time
 
 ### Key Innovation
 
@@ -29,22 +29,22 @@ Traditional accessibility is **rule-based** (WCAG guidelines) and **static** (co
 
 ---
 
-## 🏗️ Architecture
+## Architecture
 
 ```
 ┌────────────────────────────────────────────────────────────┐
 │                   PERCEPTION LAYER                         │
-│  🎤 Voice (ASR)  │  👁️ Vision (MediaPipe)  │  📊 Behavior│
+│   Voice (ASR)  │   Vision (MediaPipe)  │   Behavior        │
 └──────────────────────────┬─────────────────────────────────┘
                            ▼
 ┌──────────────────────────────────────────────────────────────┐
 │                  INTELLIGENCE LAYER                          │
-│  📦 Context Bundle  →  🤖 LLM Orchestrator  →  ✅ Validator │
+│   Context Bundle  →  LLM Orchestrator  →   Validator         │
 └──────────────────────────┬───────────────────────────────────┘
                            ▼
 ┌──────────────────────────────────────────────────────────────┐
 │                   EXECUTION LAYER                            │
-│  🖥️ UI Adaptation  │  🎯 Kiosk Control  │  🔊 TTS Output   │
+│  UI Adaptation  │   Kiosk Control  │   TTS Output            │
 └──────────────────────────────────────────────────────────────┘
 ```
 
@@ -52,7 +52,7 @@ The system follows a **6-layer pipeline**: Perception → Modeling → Orchestra
 
 ---
 
-## 📁 Project Structure
+## Project Structure
 
 ```
 uiaa-prototype/
@@ -115,7 +115,7 @@ uiaa-prototype/
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Prerequisites
 
@@ -166,7 +166,7 @@ python overlay_main.py
 
 ---
 
-## 🎮 Demo Guide
+## Demo Guide
 
 ### Web Prototype Demo
 
@@ -187,7 +187,7 @@ python overlay_main.py
 
 ---
 
-## 🔑 Features
+## Features
 
 ### Perception Layer
 | Signal | Technology | Description |
@@ -217,7 +217,7 @@ python overlay_main.py
 
 ---
 
-## 🛡️ Safety & Privacy
+## Safety & Privacy
 
 - **Command Allowlist** — only valid kiosk commands are executed
 - **Amount Validation** — withdrawal amounts capped at ₹25,000, multiples of ₹100
@@ -243,14 +243,14 @@ The project is designed to work within Gemini's free tier. A typical 15-minute d
 
 ---
 
-## 📚 Documentation
+## Documentation
 
 - [Full Project Documentation](docs/PROJECT_DOCUMENTATION.md) — detailed technical writeup
 - [Architecture Diagrams](docs/ARCHITECTURE.md) — system architecture visualizations
 
 ---
 
-## 🧪 Tech Stack
+## Tech Stack
 
 | Component | Technology |
 |-----------|------------|
@@ -266,15 +266,15 @@ The project is designed to work within Gemini's free tier. A typical 15-minute d
 
 ---
 
-## 📄 License
+## License
 
-This project is developed as part of a TCS iON Internship. See [LICENSE](LICENSE) for details.
+This project is developed as an open-source prototype for universal accessibility. See [LICENSE](LICENSE) for details.
 
 ---
 
-## 🙏 Acknowledgments
+## Acknowledgments
 
-- **TCS iON** — Internship program and mentorship
+- **Community Contributors** — Feedback and testing
 - **Google AI Studio** — Gemini API access
 - **MediaPipe** — On-device ML framework
 - **FastAPI** — High-performance Python web framework
