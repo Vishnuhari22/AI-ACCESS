@@ -127,8 +127,8 @@ uiaa-prototype/
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/uiaa-prototype.git
-cd uiaa-prototype
+git clone https://github.com/Vishnuhari22/AI-ACCESS.git
+cd AI-ACCESS
 ```
 
 ### 2. Set Up the Backend
