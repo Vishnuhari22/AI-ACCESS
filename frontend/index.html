@@ -1,0 +1,179 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>UIAA Prototype — Intelligent Accessibility Agent</title>
+    <meta name="description" content="Universal Intelligent Accessibility Agent prototype for smart kiosk interaction">
+    <link rel="stylesheet" href="css/main.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Kiosk Simulator Panel -->
+        <main class="panel kiosk-panel">
+            <div class="kiosk-frame">
+                <header class="kiosk-header">
+                    <h2 id="kiosk-title">🏧 Smart ATM</h2>
+                    <div class="kiosk-header-right">
+                        <span class="latency-badge" id="latency-badge" title="Pipeline latency">— ms</span>
+                        <div class="accessibility-status" id="accessibility-status">Ready</div>
+                    </div>
+                </header>
+                <div class="kiosk-screen" id="kiosk-screen">
+                    <div class="kiosk-welcome">
+                        <div class="welcome-icon">🏧</div>
+                        <h1>Welcome</h1>
+                        <p>Tap the microphone and speak to begin your transaction.</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Voice Bar -->
+            <div class="voice-bar">
+                <button id="mic-btn" class="mic-btn" aria-label="Microphone">
+                    <svg viewBox="0 0 24 24" width="24" height="24" stroke="currentColor" stroke-width="2" fill="none">
+                        <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"></path>
+                        <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+                        <line x1="12" y1="19" x2="12" y2="23"></line>
+                        <line x1="8" y1="23" x2="16" y2="23"></line>
+                    </svg>
+                </button>
+                <div class="transcript-box" id="transcript-box">Tap the microphone and speak...</div>
+            </div>
+        </main>
+
+        <!-- Control & Monitoring Panel -->
+        <aside class="panel control-panel">
+            <header class="section-header">
+                <h2>Control Panel</h2>
+                <span class="status-indicator" id="ws-status">Disconnected</span>
+            </header>
+
+            <!-- Kiosk Mode Switch -->
+            <section class="control-section">
+                <h3>Kiosk Configuration</h3>
+                <div class="switch-group">
+                    <label for="kiosk-mode-select">Kiosk Mode</label>
+                    <select id="kiosk-mode-select">
+                        <option value="atm">🏧 ATM</option>
+                        <option value="hospital">🏥 Hospital</option>
+                    </select>
+                </div>
+            </section>
+
+            <!-- Webcam / Vision Analysis -->
+            <section class="control-section">
+                <h3>📷 Vision Analysis</h3>
+                <div class="webcam-container">
+                    <div class="webcam-wrapper" id="webcam-wrapper">
+                        <video id="webcam-video" autoplay muted playsinline></video>
+                        <canvas id="webcam-canvas"></canvas>
+                        <div class="webcam-overlay" id="webcam-overlay">
+                            <span>Camera Off</span>
+                        </div>
+                    </div>
+                    <div class="webcam-controls">
+                        <button id="webcam-toggle" class="webcam-btn">
+                            📷 Enable Camera
+                        </button>
+                        <div class="vision-signals" id="vision-signals">
+                            <span class="signal-tag" id="sig-face">No Face</span>
+                            <span class="signal-tag" id="sig-eyes">Eyes: —</span>
+                            <span class="signal-tag" id="sig-distance">Dist: —</span>
+                            <span class="signal-tag" id="sig-tremor">✋ Tremor: —</span>
+                            <span class="signal-tag" id="sig-wheelchair">♿ Wheelchair: —</span>
+                            <span class="signal-tag" id="sig-bystander">👥 Bystander: —</span>
+                            <span class="signal-tag" id="sig-age">👤 Age: —</span>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- User State Sliders -->
+            <section class="control-section">
+                <h3>User State Simulation</h3>
+
+                <div class="slider-group">
+                    <label for="visual-cap">👁️ Visual Capability <span id="visual-cap-val">1.0</span></label>
+                    <input type="range" id="visual-cap" min="0" max="1" step="0.1" value="1.0">
+                </div>
+                <div class="slider-group">
+                    <label for="motor-cap">🖐️ Motor Capability <span id="motor-cap-val">1.0</span></label>
+                    <input type="range" id="motor-cap" min="0" max="1" step="0.1" value="1.0">
+                </div>
+                <div class="slider-group">
+                    <label for="cognitive-load">🧠 Cognitive Load <span id="cognitive-load-val">0.0</span></label>
+                    <input type="range" id="cognitive-load" min="0" max="1" step="0.1" value="0.0">
+                </div>
+                <div class="slider-group">
+                    <label for="frustration">😤 Frustration Level <span id="frustration-val">0.0</span></label>
+                    <input type="range" id="frustration" min="0" max="1" step="0.1" value="0.0">
+                </div>
+
+                <div class="switch-group">
+                    <label for="interaction-speed">⏱️ Interaction Speed</label>
+                    <select id="interaction-speed">
+                        <option value="slow">Slow</option>
+                        <option value="normal" selected>Normal</option>
+                        <option value="fast">Fast</option>
+                    </select>
+                </div>
+                <div class="switch-group">
+                    <label for="age-group">👤 Age Group</label>
+                    <select id="age-group">
+                        <option value="child">Child</option>
+                        <option value="adult" selected>Adult</option>
+                        <option value="elderly">Elderly</option>
+                    </select>
+                </div>
+                <div class="switch-group">
+                    <label for="language-pref">🌐 Preferred Language</label>
+                    <select id="language-pref">
+                        <option value="en" selected>English</option>
+                        <option value="hi">Hindi</option>
+                        <option value="ta">Tamil</option>
+                    </select>
+                </div>
+
+                <!-- Behavioral Flags -->
+                <div class="flags-group">
+                    <label>🚩 Behavioral Flags <span class="auto-label" id="auto-detect-label"></span></label>
+                    <div class="checkbox-row">
+                        <label><input type="checkbox" value="squinting" class="behavior-flag" id="flag-squinting"> Squinting</label>
+                        <label><input type="checkbox" value="leaning_forward" class="behavior-flag" id="flag-leaning"> Leaning Forward</label>
+                    </div>
+                    <div class="checkbox-row">
+                        <label><input type="checkbox" value="hand_tremor" class="behavior-flag"> Hand Tremor</label>
+                        <label><input type="checkbox" value="repeated_errors" class="behavior-flag"> Repeated Errors</label>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Conversation History -->
+            <section class="control-section">
+                <h3>💬 Conversation</h3>
+                <div class="conversation-box" id="conversation-box"></div>
+            </section>
+
+            <!-- LLM Reasoning Viewer -->
+            <section class="control-section">
+                <h3>🧠 LLM Reasoning</h3>
+                <div class="reasoning-box" id="reasoning-box">Waiting for first interaction...</div>
+            </section>
+
+            <!-- System Log -->
+            <section class="control-section log-section">
+                <h3>📋 System Log</h3>
+                <div class="log-container" id="system-log"></div>
+            </section>
+        </aside>
+    </div>
+
+    <script src="js/voice.js?v=6"></script>
+    <script src="js/websocket.js?v=6"></script>
+    <script src="js/vision.js?v=6"></script>
+    <script src="js/kiosk.js?v=6"></script>
+    <script src="js/app.js?v=6"></script>
+</body>
+</html>

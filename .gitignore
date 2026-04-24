@@ -1,0 +1,41 @@
+# ─── Python ───
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.task
+dist/
+build/
+*.egg
+
+# ─── Virtual Environment ───
+venv/
+.venv/
+env/
+
+# ─── Environment / Secrets ───
+.env
+!.env.example
+
+# ─── Debug artifacts ───
+debug_screenshot.png
+
+# ─── IDE ───
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ─── OS ───
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ─── Logs ───
+*.log
+
+# ─── Misc ───
+*.bak
+*.tmp

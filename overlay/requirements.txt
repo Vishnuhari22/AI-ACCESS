@@ -1,0 +1,21 @@
+# Core computer vision + ML
+opencv-python>=4.8.0
+mediapipe>=0.10.9
+
+# Screen capture + click injection
+mss>=9.0.0
+pyautogui>=0.9.54
+
+# Voice I/O
+pyttsx3>=2.90
+pywin32>=306          # Required by pyttsx3 SAPI5 driver on Windows
+SpeechRecognition>=3.10.0
+pyaudio>=0.2.14
+
+# Gemini AI + OpenAI fallback + environment
+google-genai>=1.0.0           # New official Gemini SDK (replaces google-generativeai)
+openai>=1.0.0                 # Fallback provider when Gemini is rate-limited
+python-dotenv>=1.0.0
+
+# Image handling
+Pillow>=10.0.0
