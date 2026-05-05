@@ -14,10 +14,13 @@ import threading
 import time
 from datetime import datetime
 
-from screen_reader import capture_screen, analyze_screen_and_intent
+from screen_reader import (capture_screen, analyze_screen_and_intent,
+                          analyze_follow_up, verify_anchor, analyze_proactive)
 from overlay_voice import OverlayVoice
 from overlay_vision import OverlayVision
-from overlay_adapter import inject_click
+from overlay_adapter import inject_click, inject_text, inject_keys
+from proactive_monitor import ProactiveMonitor
+from escalation import EscalationManager, EscalationState
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -75,9 +78,14 @@ class OverlayApp:
         self.root = root
         self.root.title("UIAA Universal Overlay")
         self.root.attributes("-topmost", True)
-        self.root.geometry("460x780+50+50")
+        self._base_width = 460
+        self._base_height = 650
+        # Position at top-right corner of primary monitor
+        screen_w = self.root.winfo_screenwidth()
+        x_pos = max(0, screen_w - self._base_width - 16)
+        self.root.geometry(f"{self._base_width}x{self._base_height}+{x_pos}+30")
         self.root.configure(bg=Palette.BG)
-        self.root.minsize(400, 600)
+        self.root.minsize(400, 500)
 
         # --- Core modules ---
         self.voice = OverlayVoice()
@@ -95,6 +103,13 @@ class OverlayApp:
         self._cycle_had_error = False
         self._demo_mode = tk.BooleanVar(value=True)
         self._current_targets = []      # keep reference for re-rendering on adaptation change
+        self._last_cycle_time = time.time()
+
+        # --- Escalation Manager ---
+        self._escalation = EscalationManager(
+            on_state_change=lambda st, ctx: self.root.after(
+                0, self._on_escalation_change, st, ctx)
+        )
 
         # Hysteresis: require N consecutive readings before switching adaptation
         self._HYSTERESIS_THRESHOLD = 6  # 6 × 0.5s = 3 seconds of stable signal
@@ -229,9 +244,10 @@ class OverlayApp:
         )
         self.keypad_title.pack(side=tk.LEFT)
 
-        # Scrollable keypad container
-        self.keypad_outer = tk.Frame(root, bg=Palette.BG)
-        self.keypad_outer.pack(fill=tk.BOTH, expand=True, padx=12, pady=2)
+        # Scrollable keypad container — fixed max height so it doesn't push log off
+        self.keypad_outer = tk.Frame(root, bg=Palette.BG, height=160)
+        self.keypad_outer.pack(fill=tk.X, padx=12, pady=2)
+        self.keypad_outer.pack_propagate(False)  # enforce fixed height
 
         self.keypad_canvas = tk.Canvas(self.keypad_outer, bg=Palette.BG,
                                         highlightthickness=0, bd=0)
@@ -260,12 +276,12 @@ class OverlayApp:
                  anchor="w").pack(side=tk.LEFT)
 
         self.log_text = tk.Text(
-            root, height=5, bg=Palette.BG_INPUT, fg=Palette.TEXT_DIM,
+            root, height=8, bg=Palette.BG_INPUT, fg=Palette.TEXT_DIM,
             font=self._fonts["log"], relief=tk.FLAT, wrap=tk.WORD,
             padx=8, pady=4, state=tk.DISABLED, cursor="arrow",
             insertbackground=Palette.TEXT_DIM
         )
-        self.log_text.pack(fill=tk.X, padx=12, pady=(2, 4))
+        self.log_text.pack(fill=tk.BOTH, expand=True, padx=12, pady=(2, 4))
 
         # ⑨ Demo/Live Toggle
         self.controls_frame = tk.Frame(root, bg=Palette.BG)
@@ -280,6 +296,28 @@ class OverlayApp:
         )
         self.demo_cb.pack(side=tk.LEFT)
 
+        # ⑩ Escalation Banner (hidden by default)
+        self.escalation_frame = tk.Frame(root, bg="#ff1744")
+        self._escalation_var = tk.StringVar(value="")
+        self.escalation_lbl = tk.Label(
+            self.escalation_frame, textvariable=self._escalation_var,
+            font=self._fonts["desc"], fg="white", bg="#ff1744",
+            wraplength=420, justify=tk.LEFT, padx=12, pady=10
+        )
+        self.escalation_lbl.pack(fill=tk.X)
+        self._escalation_visible = False
+
+        # ⑪ Sensitive Data On-Screen Display (hidden by default)
+        self._sensitive_frame = tk.Frame(root, bg="#1a237e")
+        self._sensitive_var = tk.StringVar(value="")
+        self._sensitive_lbl = tk.Label(
+            self._sensitive_frame, textvariable=self._sensitive_var,
+            font=self._fonts["desc"], fg="#e8eaf6", bg="#1a237e",
+            wraplength=420, justify=tk.LEFT, padx=12, pady=8
+        )
+        self._sensitive_lbl.pack(fill=tk.X)
+        self._sensitive_visible = False
+
         # ──────────────────────────────────────────────────────────────────
         # Start background threads
         # ──────────────────────────────────────────────────────────────────
@@ -289,6 +327,17 @@ class OverlayApp:
             self._vision_status.set("No camera")
             if self._vision_dot:
                 self._vision_dot.config(fg=Palette.ERROR)
+
+        # Start Proactive Monitor
+        self._proactive = ProactiveMonitor(
+            get_state_fn=lambda: (self.vision.get_latest_state()
+                                  if self.vision else {}),
+            trigger_fn=self._run_proactive_check,
+            inactivity_threshold=30,
+            frustration_threshold=10,
+            cooldown=60,
+        )
+        self._proactive.start()
 
         self._log("System initialized. Ready.")
 
@@ -341,7 +390,14 @@ class OverlayApp:
         self._adaptation_level = level
         scale = self._FONT_SCALE[level]
 
-        print(f"[Overlay] Adaptation: {old_level} → {level} (scale {scale}x)")
+        print(f"[Overlay] Adaptation: {old_level} -> {level} (scale {scale}x)")
+
+        # --- 0. Dynamic window resize (fluid container) --- 
+        new_w = int(self._base_width * scale)
+        new_h = int(self._base_height * scale)
+        screen_w = self.root.winfo_screenwidth()
+        x_pos = max(0, screen_w - new_w - 16)
+        self.root.geometry(f"{new_w}x{new_h}+{x_pos}+30")
 
         # --- 1. Rescale all fonts ---
         self._rescale_fonts(scale)
@@ -456,7 +512,13 @@ class OverlayApp:
             if state["face_detected"]:
                 sq_text = "Squinting ⚠️" if state["squinting"] else "Normal"
                 ln_text = "Leaning ↗️" if state["leaning_forward"] else "Normal"
-                status = f"👁 {sq_text} | Posture: {ln_text}"
+                ld_text = " | 👇 Down" if state.get("looking_down") else ""
+                # Show eye calibration status
+                if self.vision._baseline_eye_gap > 0.001:
+                    eye_info = f" | 👁 {self.vision._baseline_eye_gap:.3f}"
+                else:
+                    eye_info = " | 👁 cal…"
+                status = f"👁 {sq_text} | {ln_text}{ld_text}{eye_info}"
                 dot_color = Palette.WARNING if (state["squinting"] or state["leaning_forward"]) else Palette.SUCCESS
             else:
                 status = "No face detected"
@@ -530,6 +592,77 @@ class OverlayApp:
                 self._desc_visible = False
         self.root.after(0, _show)
 
+    def _show_sensitive_on_screen(self, text: str):
+        """Display sensitive data visually (no TTS) with auto-hide."""
+        def _show():
+            self._sensitive_var.set(f"🔒 {text}")
+            if not self._sensitive_visible:
+                self._sensitive_frame.pack(fill=tk.X, padx=12, pady=2)
+                self._sensitive_visible = True
+            # Auto-hide after 8 seconds
+            self.root.after(8000, self._hide_sensitive)
+        self.root.after(0, _show)
+
+    def _hide_sensitive(self):
+        if self._sensitive_visible:
+            self._sensitive_frame.pack_forget()
+            self._sensitive_visible = False
+            self._sensitive_var.set("")
+
+    def _on_escalation_change(self, new_state: EscalationState, ctx: dict):
+        """Handle escalation state transitions — update UI."""
+        if new_state == EscalationState.ESCALATING:
+            self._escalation_var.set(
+                "⚠ I'm having trouble helping. Connecting to a human assistant…")
+            if not self._escalation_visible:
+                self.escalation_frame.pack(fill=tk.X, padx=12, pady=4)
+                self._escalation_visible = True
+            self.voice.speak(
+                "I'm having trouble with your request. "
+                "Let me connect you with a human assistant.")
+            self._log(f"🚨 ESCALATION triggered ({ctx.get('failures', 0)} failures)")
+            # Simulate human connection after 5 seconds
+            self.root.after(5000, self._simulate_human_connect)
+        elif new_state == EscalationState.CONNECTED:
+            self._escalation_var.set(
+                "✅ Human assistant connected. You can describe your issue.")
+            self._log("✅ Human agent connected (simulated)")
+        elif new_state == EscalationState.NORMAL:
+            if self._escalation_visible:
+                self.escalation_frame.pack_forget()
+                self._escalation_visible = False
+            self._log("Escalation reset — AI recovered.")
+
+    def _simulate_human_connect(self):
+        self._escalation.simulate_human_connected()
+
+    def _run_proactive_check(self, reason: str):
+        """Called by ProactiveMonitor when the user appears stuck."""
+        self._log(f"🤖 Proactive trigger: {reason}")
+        self._set_engine_status("Proactive check…", Palette.WARNING)
+
+        def _do_check():
+            try:
+                img, mon = capture_screen(hide_window=None)
+                result = analyze_proactive(img, reason)
+                if result:
+                    speech = result.get("speech_response", "")
+                    desc = result.get("screen_description", "")
+                    if speech:
+                        sensitive = result.get("is_sensitive", False)
+                        spoken = self.voice.speak(speech, sensitive=sensitive)
+                        if not spoken:
+                            self._show_sensitive_on_screen(speech)
+                    if desc:
+                        self._set_description(desc)
+                    self._log(f"🤖 Proactive: \"{speech[:60]}\"")
+                self._set_engine_status("Idle", Palette.SUCCESS)
+            except Exception as e:
+                print(f"[Overlay] Proactive check error: {e}")
+                self._set_engine_status("Idle", Palette.SUCCESS)
+
+        threading.Thread(target=_do_check, daemon=True).start()
+
     # ══════════════════════════════════════════════════════════════════════
     # Virtual Keypad — Upgraded with numbers, icons, colours, scrolling
     # ══════════════════════════════════════════════════════════════════════
@@ -585,7 +718,7 @@ class OverlayApp:
                         ymin, xmin, ymax, xmax = b
                         nx = ((xmin + xmax) / 2) / 1000.0
                         ny = ((ymin + ymax) / 2) / 1000.0
-                        self._log(f"⚡ Keypad click → '{target_info.get('name')}' ({nx:.3f}, {ny:.3f})")
+                        self._log(f"Keypad click -> '{target_info.get('name')}' ({nx:.3f}, {ny:.3f})")
                         inject_click(nx, ny, mon)
                     else:
                         self._log(f"❌ No coordinates for '{target_info.get('name')}'")
@@ -624,6 +757,9 @@ class OverlayApp:
 
     def run_cycle(self):
         self._cycle_had_error = False
+        self._last_cycle_time = time.time()
+        if hasattr(self, '_proactive'):
+            self._proactive.record_cycle()
         try:
             # --- Step 1: Listen ---
             self._set_voice_status("Listening…", Palette.WARNING)
@@ -672,11 +808,17 @@ class OverlayApp:
             selected = response.get("selected_targets") or []
             self._log(f"🧠 Gemini responded: {len(targets)} targets, {len(selected)} selected")
 
-            # --- Step 5: Speak response ---
+            # --- Step 5: Speak response (with privacy gate) ---
             speech = response.get("speech_response", "")
+            is_sensitive = response.get("is_sensitive", False)
             if speech:
-                self.voice.speak(speech)
-                self._log(f"🔊 Speaking: \"{speech[:60]}{'…' if len(speech) > 60 else ''}\"")
+                spoken = self.voice.speak(speech, sensitive=is_sensitive)
+                if not spoken:
+                    # Sensitive data suppressed — show on screen instead
+                    self._show_sensitive_on_screen(speech)
+                    self._log(f"🔒 Sensitive (screen only): \"{speech[:60]}\"")
+                else:
+                    self._log(f"🔊 Speaking: \"{speech[:60]}{'…' if len(speech) > 60 else ''}\"")
 
             # --- Step 6: Update UI ---
             screen_desc = response.get("screen_description", "")
@@ -697,38 +839,102 @@ class OverlayApp:
                 if target and isinstance(target, dict) and target.get("box_2d"):
                     box = target["box_2d"]
                     if isinstance(box, list) and len(box) == 4:
-                        ymin, xmin, ymax, xmax = box
+                        try:
+                            box = [float(v) for v in box]
+                            ymin, xmin, ymax, xmax = box
+                        except (ValueError, TypeError):
+                            self._log(f"⚠ Invalid coords type for '{target.get('name', '?')}': {box}")
+                            continue
 
                         # --- Coordinate validation ---
-                        # Check values are in valid range
                         if not all(0 <= v <= 1000 for v in box):
                             self._log(f"⚠ Invalid coords for '{target.get('name', '?')}': {box} (out of range)")
                             continue
-
-                        # Check box is not inverted or zero-size
                         if ymax <= ymin or xmax <= xmin:
                             self._log(f"⚠ Invalid box for '{target.get('name', '?')}': {box} (inverted/zero)")
                             continue
-
-                        # Check box isn't in taskbar area (bottom 5% of screen)
                         center_y = (ymin + ymax) / 2
                         if center_y > 960:
                             self._log(f"⚠ Skipping '{target.get('name', '?')}': coords ({box}) point to taskbar area")
                             continue
 
+                        # --- Visual Anchor Verification ---
+                        # Re-verify target position to handle scroll drift
+                        verified_box = verify_anchor(
+                            target.get('name', ''),
+                            box, mon, hide_window=None
+                        )
+                        if verified_box is None:
+                            self._log(f"⚠ Anchor lost for '{target.get('name', '?')}' — skipping click")
+                            continue
+                        if verified_box != box:
+                            self._log(f"🔄 Anchor shifted for '{target.get('name', '?')}': {box} → {verified_box}")
+                            box = verified_box
+                            ymin, xmin, ymax, xmax = [float(v) for v in box]
+
                         nx = ((xmin + xmax) / 2) / 1000.0
                         ny = ((ymin + ymax) / 2) / 1000.0
-                        self._log(f"⚡ Click → '{target.get('name', '?')}' at ({nx:.3f}, {ny:.3f})")
+                        self._log(f"Click -> '{target.get('name', '?')}' at ({nx:.3f}, {ny:.3f})")
                         inject_click(nx, ny, mon)
-                        time.sleep(0.4)
+                        time.sleep(0.3)
 
-            self._set_engine_status("✅ Done", Palette.SUCCESS)
+                        # If Gemini says to type text into this field, do it
+                        text_to_type = target.get("type_text")
+                        if text_to_type and isinstance(text_to_type, str):
+                            self._log(f"Typing -> '{text_to_type}'")
+                            inject_text(text_to_type)
+                            time.sleep(0.2)
+
+                        # If Gemini says to press keys (for dropdowns, autocomplete, etc.)
+                        keys_to_press = target.get("press_keys")
+                        if keys_to_press and isinstance(keys_to_press, list):
+                            self._log(f"Keys -> {keys_to_press}")
+                            inject_keys(keys_to_press)
+                            time.sleep(0.3)
+
+                        # If Gemini says a follow-up is needed (e.g. dropdown opened,
+                        # need to take a new screenshot to find the right option)
+                        follow_up = target.get("follow_up")
+                        if follow_up and isinstance(follow_up, str):
+                            self._log(f"Follow-up: {follow_up}")
+                            self._set_engine_status("Re-scanning dropdown...", Palette.WARNING)
+
+                            # Wait for dropdown animation to complete
+                            time.sleep(2.5)
+
+                            # Take a new screenshot (do not hide overlay to prevent stealing focus and closing the dropdown)
+                            img2, mon2 = capture_screen(hide_window=None)
+                            self._log(f"Second screenshot captured ({img2.size[0]}x{img2.size[1]})")
+
+                            # Ask Gemini to find the specific option
+                            fu_result = analyze_follow_up(img2, follow_up)
+                            if fu_result and fu_result.get("box_2d"):
+                                fu_box = fu_result["box_2d"]
+                                fu_name = fu_result.get("name", "?")
+                                if isinstance(fu_box, list) and len(fu_box) == 4:
+                                    try:
+                                        fy1, fx1, fy2, fx2 = [float(v) for v in fu_box]
+                                        fu_nx = ((fx1 + fx2) / 2) / 1000.0
+                                        fu_ny = ((fy1 + fy2) / 2) / 1000.0
+                                        self._log(f"Follow-up click -> '{fu_name}' at ({fu_nx:.3f}, {fu_ny:.3f})")
+                                        inject_click(fu_nx, fu_ny, mon2)
+                                        time.sleep(0.3)
+                                    except ValueError:
+                                        self._log("Follow-up: invalid coordinates returned")
+                            else:
+                                self._log("Follow-up: option not found in dropdown")
+
+            self._set_engine_status("Done", Palette.SUCCESS)
+            # Record success for escalation tracking
+            self._escalation.record_success()
 
         except Exception as exc:
             self._cycle_had_error = True
             print(f"[Overlay] run_cycle error: {exc}")
             self._set_engine_status(f"❌ {exc}", Palette.ERROR)
             self._log(f"❌ Error: {exc}")
+            # Record failure for escalation tracking
+            self._escalation.record_failure(str(exc))
         finally:
             if not self._cycle_had_error:
                 self._set_voice_status("Ready", Palette.SUCCESS)
@@ -749,6 +955,8 @@ class OverlayApp:
     # ══════════════════════════════════════════════════════════════════════
     def on_closing(self):
         self.running = False
+        if hasattr(self, '_proactive'):
+            self._proactive.stop()
         if self.vision:
             self.vision.release()
         self.root.destroy()

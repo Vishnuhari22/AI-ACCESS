@@ -59,6 +59,7 @@ JSON Schema:
 {
     "screen_description": "Short plain-English summary of what is on screen",
     "speech_response": "What the TTS engine should read aloud to the user",
+    "is_sensitive": false,
     "targets": [
         {
             "name": "Label of the button, link, or input field",
@@ -68,8 +69,11 @@ JSON Schema:
     ],
     "selected_targets": [
         {
-            "name": "The target(s) matched to the user's request sequentially, or empty if none",
-            "box_2d": [ymin, xmin, ymax, xmax]
+            "name": "The target(s) matched to the user's request",
+            "box_2d": [ymin, xmin, ymax, xmax],
+            "type_text": "Text to type into the field after clicking, or null",
+            "press_keys": ["key1", "key2"],
+            "follow_up": "Description of what to click next after this action opens a menu/dropdown, or null"
         }
     ]
 }
@@ -77,10 +81,30 @@ JSON Schema:
 Rules:
 - box_2d values are integers 0-1000 representing [ymin, xmin, ymax, xmax] on a 1000x1000 grid.
 - The grid maps to the FULL screenshot: (0,0) is top-left of the monitor, (1000,1000) is bottom-right.
+- is_sensitive: set to true when the speech_response contains private data such as PINs, passwords, account numbers, balances, or OTPs. Otherwise false.
 - EVERY item in 'targets' MUST have its own box_2d. Do not omit any.
 - Make bounding boxes TIGHT around the clickable element — do not use overly large boxes.
 - Leave 'selected_targets' as an empty array [] when the user is only asking what is available (not requesting an action).
 - Never return null for selected_targets — always use an empty array [].
+- When the user just wants to click a button or link with no text entry, set "type_text" to null.
+
+TEXT INPUT RULES:
+- When the user's voice input implies typing into a field (e.g. "from Chengannur", "enter 5000", "search for trains"), set "type_text" to ONLY the value to type (e.g. "Chengannur", "5000", "trains").
+- The system will automatically clear any existing text in the field before typing.
+- IMPORTANT: Identify the CORRECT target field from context. "from Chengannur" means the FROM/SOURCE field. "to Trivandrum" means the TO/DESTINATION field. Do NOT just type into whatever field is currently active — click the RIGHT field first.
+
+KEYBOARD ACTIONS (press_keys):
+- press_keys is an array of keyboard keys to press AFTER the click and optional typing are done.
+- Supported keys: "enter", "tab", "down", "up", "left", "right", "escape", "backspace", "delete", "space", "home", "end", "pageup", "pagedown"
+- Special: "wait:N" pauses for N milliseconds (e.g. "wait:1000" waits 1 second).
+- Set press_keys to null or omit it when no keyboard action is needed.
+
+CRITICAL RULES FOR DROPDOWNS AND AUTOCOMPLETE:
+- For AUTOCOMPLETE/SEARCH input fields (station name, city, etc.): after setting type_text, set follow_up to describe which suggestion to select (e.g. "Select CHENGANNUR - CGNR from the autocomplete suggestions" or "Click the first matching station suggestion"). The system will type the text, wait for the suggestion dropdown to appear, take a NEW screenshot, and click the correct suggestion. Do NOT use press_keys for autocomplete — many websites require an actual click on the suggestion.
+- For DROPDOWN/SELECT menus (class selection, quota, etc.): You CANNOT see the dropdown options before they open. Set follow_up to describe what option to click (e.g. "Click on Third AC (3A)" or "Select Second AC (2A)"). The system will click the dropdown, wait for it to open, take a NEW screenshot, and use your follow_up instruction to find and click the correct option.
+- Set follow_up to null when no second action is needed (most cases — buttons, links, etc.).
+- For DATE PICKERS: click the date input field. Use press_keys to navigate if needed.
+- NEVER guess how many arrow-down presses are needed for a dropdown — you cannot see the options.
 """
 
 # Gemini models to try in order (flash/lite only — Pro is no longer free tier)
@@ -202,9 +226,10 @@ def _normalise_response(parsed: dict) -> dict:
     if not isinstance(targets, list):
         parsed["targets"] = []
 
-    # Ensure screen_description and speech_response exist
+    # Ensure screen_description, speech_response, and is_sensitive exist
     parsed.setdefault("screen_description", "")
     parsed.setdefault("speech_response", "")
+    parsed.setdefault("is_sensitive", False)
 
     return parsed
 
@@ -242,6 +267,7 @@ def analyze_screen_and_intent(screenshot: Image.Image,
                     model=model_name,
                     contents=contents,
                     config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
                         temperature=0.2,      # Low temperature for reliable JSON
                         max_output_tokens=2048,
                     ),
@@ -272,6 +298,7 @@ def analyze_screen_and_intent(screenshot: Image.Image,
                         model=model_name,
                         contents=retry_contents,
                         config=types.GenerateContentConfig(
+                            response_mime_type="application/json",
                             temperature=0.1,
                             max_output_tokens=2048,
                         ),
@@ -344,6 +371,90 @@ def analyze_screen_and_intent(screenshot: Image.Image,
         print("[ScreenReader] OpenAI fallback also failed.")
     else:
         print("[ScreenReader] No OpenAI fallback available.")
+
+    return None
+
+
+def analyze_follow_up(screenshot: Image.Image,
+                      follow_up_instruction: str) -> dict | None:
+    """Takes a second screenshot and asks Gemini to find a specific element.
+
+    Used after opening a dropdown/menu — the follow_up_instruction describes
+    what option to click (e.g. "Click on Third AC (3A)").
+
+    Returns a dict with 'box_2d' for the target, or None on failure.
+    """
+    if _client is None:
+        return None
+
+    buf = io.BytesIO()
+    screenshot.save(buf, format="PNG")
+    image_bytes = buf.getvalue()
+
+    follow_up_prompt = f"""You are looking at a screenshot of a desktop. A dropdown menu or popup is now open on screen.
+
+Your task: {follow_up_instruction}
+
+Find the EXACT option in the visible dropdown/menu and return its coordinates.
+If the option is not visible (needs scrolling), look for a scroll area and return the coordinates of
+the option that is closest to what was requested. If you need to scroll down to find it,
+return the coordinates of the scrollbar's down area or the last visible item.
+
+Return ONLY a JSON object:
+{{
+    "found": true,
+    "name": "exact text of the option found",
+    "box_2d": [ymin, xmin, ymax, xmax]
+}}
+
+Or if the option is not visible at all:
+{{
+    "found": false,
+    "name": null,
+    "box_2d": null
+}}
+
+box_2d values are integers 0-1000 on a 1000x1000 grid mapped to the full screenshot.
+Place coordinates precisely on the CENTER of the target option text.
+"""
+
+    contents = [
+        follow_up_prompt,
+        types.Part.from_bytes(data=image_bytes, mime_type="image/png"),
+    ]
+
+    # Try only the fastest model for follow-up (speed matters)
+    for model_name in _MODEL_PRIORITY[:1]:
+        try:
+            start_t = time.time()
+            print(f"[ScreenReader] Follow-up call to {model_name}...")
+
+            response = _client.models.generate_content(
+                model=model_name,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.1,
+                    max_output_tokens=512,
+                ),
+            )
+
+            elapsed = time.time() - start_t
+            text = response.text.strip()
+            text = _strip_markdown_fences(text)
+
+            print(f"[ScreenReader] Follow-up responded in {elapsed:.1f}s")
+
+            parsed = json.loads(text)
+            if parsed.get("found") and parsed.get("box_2d"):
+                return parsed
+            else:
+                print(f"[ScreenReader] Follow-up: option not found")
+                return None
+
+        except Exception as e:
+            print(f"[ScreenReader] Follow-up error: {e}")
+            return None
 
     return None
 
@@ -421,6 +532,115 @@ def _call_openai_fallback(image_bytes: bytes,
 
     print(f"[ScreenReader] All OpenAI models failed. Last error: {last_error}")
     return None
+
+
+def verify_anchor(target_name: str, expected_box: list,
+                  monitor_info: dict, hide_window=None) -> list | None:
+    """Re-verify a target's position immediately before clicking.
+
+    Takes a fresh screenshot and asks Gemini to locate the specific element,
+    returning updated box_2d coordinates.  This prevents coordinate drift
+    caused by scrolling between the original screenshot and click injection.
+
+    Returns:
+        Updated [ymin, xmin, ymax, xmax] list, or None if not found.
+    """
+    if _client is None:
+        return expected_box  # Can't verify — use original
+
+    img, _ = capture_screen(hide_window=hide_window)
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    image_bytes = buf.getvalue()
+
+    prompt = f"""Find the UI element labelled \"{target_name}\" on this screenshot.
+Return ONLY a JSON object:
+{{
+    "found": true,
+    "box_2d": [ymin, xmin, ymax, xmax]
+}}
+Or if not visible: {{"found": false, "box_2d": null}}
+box_2d integers 0-1000 on 1000x1000 grid. Place on element CENTER."""
+
+    contents = [
+        prompt,
+        types.Part.from_bytes(data=image_bytes, mime_type="image/png"),
+    ]
+
+    model = _MODEL_PRIORITY[0]
+    try:
+        response = _client.models.generate_content(
+            model=model, contents=contents,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.1, max_output_tokens=256,
+            ),
+        )
+        text = _strip_markdown_fences(response.text.strip())
+        parsed = json.loads(text)
+        if parsed.get("found") and parsed.get("box_2d"):
+            print(f"[ScreenReader] Anchor verified: '{target_name}' at {parsed['box_2d']}")
+            return parsed["box_2d"]
+        else:
+            print(f"[ScreenReader] Anchor lost: '{target_name}' not found")
+            return None
+    except Exception as e:
+        print(f"[ScreenReader] Anchor verify error: {e}")
+        return expected_box  # Fallback to original coords
+
+
+def analyze_proactive(screenshot: Image.Image,
+                      reason: str) -> dict | None:
+    """Proactive analysis — triggered when the user appears stuck.
+
+    Args:
+        screenshot: Current screen capture.
+        reason: Why the monitor triggered (e.g. 'inactive 30s').
+
+    Returns:
+        Dict with 'speech_response' and 'screen_description', or None.
+    """
+    if _client is None:
+        return None
+
+    buf = io.BytesIO()
+    screenshot.save(buf, format="PNG")
+    image_bytes = buf.getvalue()
+
+    prompt = f"""You are the UIAA Accessibility Overlay Agent.
+The user has NOT spoken, but the system detected: {reason}.
+Look at the screenshot and provide helpful, proactive guidance.
+
+Return ONLY a JSON object:
+{{
+    "screen_description": "What is currently on screen",
+    "speech_response": "A brief, friendly offer of help (1-2 sentences)",
+    "is_sensitive": false
+}}
+
+Be concise and empathetic. Example: 'It looks like you\'re on the payment page.
+Would you like me to help you complete this transaction?'"""
+
+    contents = [
+        prompt,
+        types.Part.from_bytes(data=image_bytes, mime_type="image/png"),
+    ]
+
+    model = _MODEL_PRIORITY[0]
+    try:
+        response = _client.models.generate_content(
+            model=model, contents=contents,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.4, max_output_tokens=512,
+            ),
+        )
+        text = _strip_markdown_fences(response.text.strip())
+        return json.loads(text)
+    except Exception as e:
+        print(f"[ScreenReader] Proactive analysis error: {e}")
+        return None
 
 
 if __name__ == "__main__":

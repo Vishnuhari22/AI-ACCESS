@@ -10,19 +10,42 @@ class OverlayVoice:
         self._is_speaking = False
         self._speak_lock = threading.Lock()
 
-    def speak(self, text: str):
+    def speak(self, text: str, sensitive: bool = False) -> bool:
         """Speaks the text aloud on a background thread.
+
+        Args:
+            text: The text to speak.
+            sensitive: If True, checks for headphones first. When no
+                       private audio output is detected the call is
+                       suppressed and the method returns False so the
+                       caller can display the text on-screen instead.
+
+        Returns:
+            True if TTS will play, False if suppressed for privacy.
 
         pyttsx3 on Windows is NOT safe to call from arbitrary threads if a
         persistent engine object is shared.  Re-initialising the engine inside
         the TTS thread is the most reliable workaround on Windows.
         """
         if not text:
-            return
+            return True
+
+        # Privacy gate — never speak sensitive data over public speakers
+        if sensitive:
+            try:
+                from audio_privacy import is_headphone_connected
+                if not is_headphone_connected():
+                    print("[Voice] Sensitive data suppressed — no headphones detected.")
+                    return False
+            except ImportError:
+                # Module not available — assume public (safe default)
+                print("[Voice] audio_privacy unavailable — suppressing sensitive TTS.")
+                return False
+
         with self._speak_lock:
             if self._is_speaking:
                 print("[Voice] Already speaking — skipping overlapping TTS call.")
-                return
+                return True
             self._is_speaking = True
 
         def run_tts():
@@ -39,6 +62,7 @@ class OverlayVoice:
                     self._is_speaking = False
 
         threading.Thread(target=run_tts, daemon=True).start()
+        return True
 
     def listen_sync(self, timeout: int = 7) -> tuple[str, str]:
         """Blocks until speech is heard (or timeout) and returns (transcript, error_msg).
