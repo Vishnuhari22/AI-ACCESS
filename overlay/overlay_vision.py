@@ -1,5 +1,7 @@
 import os
 import threading
+import time
+import math
 import urllib.request
 import cv2
 import mediapipe as mp
@@ -8,10 +10,8 @@ from mediapipe.tasks.python import vision
 
 
 class OverlayVision:
-    # Re-calibrate baseline every N successful detections to adapt to user moving
-    BASELINE_RECAL_INTERVAL = 60
-
     def __init__(self):
+        # Face model
         model_path = os.path.join(os.path.dirname(__file__), "face_landmarker.task")
         if not os.path.exists(model_path):
             print("[Vision] Downloading face_landmarker.task model...")
@@ -29,6 +29,27 @@ class OverlayVision:
         )
         self.detector = vision.FaceLandmarker.create_from_options(options)
 
+        # Hand model
+        hand_model_path = os.path.join(os.path.dirname(__file__), "hand_landmarker.task")
+        if not os.path.exists(hand_model_path):
+            print("[Vision] Downloading hand_landmarker.task model...")
+            urllib.request.urlretrieve(
+                "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+                hand_model_path
+            )
+            print("[Vision] Download complete.")
+        
+        hand_base_options = python.BaseOptions(model_asset_path=hand_model_path)
+        hand_options = vision.HandLandmarkerOptions(
+            base_options=hand_base_options,
+            running_mode=vision.RunningMode.IMAGE,
+            num_hands=2,
+            min_hand_detection_confidence=0.3,
+            min_hand_presence_confidence=0.3,
+            min_tracking_confidence=0.3
+        )
+        self.hand_detector = vision.HandLandmarker.create_from_options(hand_options)
+
         self.cap = cv2.VideoCapture(0)
         if not self.cap.isOpened():
             raise RuntimeError("[Vision] Could not open webcam (index 0). Is a camera connected?")
@@ -38,39 +59,194 @@ class OverlayVision:
         self.user_state = {
             "face_detected": False,
             "squinting": False,
-            "leaning_forward": False
+            "leaning_forward": False,
+            "looking_down": False,
+            "hand_detected": False,
+            "hand_tremor": 0.0,
+            "squint_confidence": 0.0,
+            "lean_confidence": 0.0,
+            "tremor_confidence": 0.0,
+            "face_confidence": 0.0,
+            "hand_confidence": 0.0,
+            "ear": 1.0,
+            "eye_openness": 1.0
         }
 
+        # Face detection smoothing (2-second sliding window)
+        self._face_presence_history = []   # list of (timestamp, detected_bool)
+        self._consecutive_detections = 0
+        
+        # Hand tremor tracking
+        self._wrist_history = [] # list of (x, y, t)
+
+        # Calibration & baselines
         self._baseline_face_width = 0.0
-        self._baseline_face_height = 0.0   # used to normalise eye gap threshold
+        self._face_width_history = []
+        self._face_width_calibration_buf = []
+        self._lean_candidate_count = 0
+
         self._baseline_pitch = 0.0         # baseline head pitch (looking straight)
-        self._baseline_eye_gap = 0.0       # baseline normalised eye openness
-        self._frames_since_recal = 0
         self._pitch_history = []           # rolling buffer for pitch smoothing
-        self._eye_history = []             # rolling buffer for squinting smoothing
-        self._eye_calibration_buf = []     # buffer to collect initial eye readings for baseline
+
+        self._baseline_ear = 0.0           # baseline scale-invariant EAR
+        self._ear_history = []             # rolling buffer for EAR smoothing
+        self._eye_calibration_buf = []     # buffer to collect initial EAR readings for baseline
+        self._squint_candidate_count = 0
         self._debug_frame_count = 0        # for initial debug logging
 
     def get_latest_state(self) -> dict:
-        """Captures one frame, runs landmark detection, and returns the updated state dict."""
+        """Captures one frame, runs landmark detection, and returns the updated state dict with 2-second smoothing."""
+        now = time.time()
         success, image = self.cap.read()
-        if not success:
+        has_raw_face = False
+        landmarks = None
+
+        hand_detected = False
+        if success:
+            image = cv2.flip(image, 1)
+            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_rgb)
+            
+            # 1. Face detection
+            detection_result = self.detector.detect(mp_image)
+            if detection_result and detection_result.face_landmarks:
+                has_raw_face = True
+                landmarks = detection_result.face_landmarks[0]
+
+            # 2. Hand detection (always runs regardless of face presence)
+            try:
+                hand_result = self.hand_detector.detect(mp_image)
+                if hand_result and hand_result.hand_landmarks:
+                    hand_detected = True
+                    hand = hand_result.hand_landmarks[0]
+                    wrist = hand[0]
+                    
+                    self._wrist_history.append((wrist.x, wrist.y, now))
+                    if len(self._wrist_history) > 32:
+                        self._wrist_history.pop(0)
+                        
+                    if len(self._wrist_history) >= 24:
+                        hist = self._wrist_history
+                        n = len(hist)
+                        dt = hist[-1][2] - hist[0][2]
+                        if dt > 1.2:
+                            t_mean = sum(p[2] for p in hist) / n
+                            x_mean = sum(p[0] for p in hist) / n
+                            y_mean = sum(p[1] for p in hist) / n
+                            denom = sum((p[2] - t_mean) ** 2 for p in hist)
+                            slope_x = sum((p[2] - t_mean) * (p[0] - x_mean) for p in hist) / denom if denom > 1e-9 else 0.0
+                            slope_y = sum((p[2] - t_mean) * (p[1] - y_mean) for p in hist) / denom if denom > 1e-9 else 0.0
+                            residuals = [((p[0] - x_mean) - slope_x * (p[2] - t_mean), (p[1] - y_mean) - slope_y * (p[2] - t_mean), p[2]) for p in hist]
+                            rms = math.sqrt(sum(x * x + y * y for x, y, _ in residuals) / n)
+                            reversal_times = []
+                            prev_dx = prev_dy = 0.0
+                            MIN_DELTA = 0.0015
+                            for i in range(1, n):
+                                dx = residuals[i][0] - residuals[i - 1][0]
+                                dy = residuals[i][1] - residuals[i - 1][1]
+                                if abs(dx) > MIN_DELTA:
+                                    if prev_dx != 0.0 and dx * prev_dx < 0: reversal_times.append(residuals[i][2])
+                                    prev_dx = dx
+                                if abs(dy) > MIN_DELTA:
+                                    if prev_dy != 0.0 and dy * prev_dy < 0: reversal_times.append(residuals[i][2])
+                                    prev_dy = dy
+                            reversal_times.sort()
+                            intervals = [reversal_times[i] - reversal_times[i - 1] for i in range(1, len(reversal_times)) if 0.05 <= reversal_times[i] - reversal_times[i - 1] <= 0.6]
+                            median_interval = 0.0
+                            interval_cv = 1.0
+                            if len(intervals) >= 4:
+                                ordered = sorted(intervals)
+                                median_interval = ordered[len(ordered) // 2]
+                                mean_gap = sum(intervals) / len(intervals)
+                                variance = sum((x - mean_gap) ** 2 for x in intervals) / len(intervals)
+                                interval_cv = math.sqrt(variance) / mean_gap if mean_gap > 1e-6 else 1.0
+                            estimated_frequency = 1.0 / (2.0 * median_interval) if median_interval > 0 else 0.0
+                            total_path = sum(math.hypot(hist[i][0] - hist[i - 1][0], hist[i][1] - hist[i - 1][1]) for i in range(1, n))
+                            net_disp = math.hypot(hist[-1][0] - hist[0][0], hist[-1][1] - hist[0][1])
+                            tortuosity = total_path / (net_disp + 1e-4)
+                            speed = total_path / dt
+                            amplitude_score = min(1.0, max(0.0, (rms - 0.0020) / 0.0060))
+                            frequency_score = min(1.0, max(0.0, (estimated_frequency - 2.5) / 3.5))
+                            periodicity_score = min(1.0, max(0.0, 1.0 - interval_cv / 0.55)) if len(intervals) >= 4 else 0.0
+                            is_voluntary = (
+                                (net_disp > 0.14 and speed > 0.18)
+                                or (tortuosity < 1.25 and len(reversal_times) / dt < 3.0)
+                            )
+
+                            tremor_candidate = (
+                                not is_voluntary
+                                and len(reversal_times) >= 5
+                                and len(intervals) >= 3
+                                and 2.0 <= estimated_frequency <= 8.0
+                                and interval_cv <= 0.70
+                                and rms >= 0.0015
+                            )
+                            if tremor_candidate:
+                                raw_score = min(
+                                    1.0,
+                                    0.40 * amplitude_score
+                                    + 0.25 * frequency_score
+                                    + 0.35 * periodicity_score
+                                )
+                                prev = self.user_state.get("hand_tremor", 0.0)
+                                self.user_state["hand_tremor"] = prev * 0.78 + raw_score * 0.22
+                                self.user_state["tremor_confidence"] = min(1.0, (len(hist) / 32.0) * (0.45 + 0.55 * periodicity_score))
+                            else:
+                                prev = self.user_state.get("hand_tremor", 0.0)
+                                self.user_state["hand_tremor"] = prev * 0.68
+                                self.user_state["tremor_confidence"] *= 0.72
+                                if self.user_state["hand_tremor"] < 0.04: self.user_state["hand_tremor"] = 0.0
+            except Exception as e:
+                if self._debug_frame_count < 3:
+                    print(f"[Vision] Hand detection error: {e}")
+
+        if not hand_detected:
+            self._wrist_history.clear()
+            prev = self.user_state.get("hand_tremor", 0.0)
+            self.user_state["hand_tremor"] = prev * 0.6
+            if self.user_state["hand_tremor"] < 0.04:
+                self.user_state["hand_tremor"] = 0.0
+
+        # Update sliding 2.0-second presence window
+        self._face_presence_history.append((now, has_raw_face))
+        self._face_presence_history = [entry for entry in self._face_presence_history if (now - entry[0]) <= 2.0]
+
+        if has_raw_face:
+            self._consecutive_detections += 1
+            if self._consecutive_detections >= 2:
+                face_detected = True
+            else:
+                face_detected = self.user_state.get("face_detected", True)
+        else:
+            self._consecutive_detections = 0
+            # Only transition to "No Face" if no face was detected across the entire 2.0-second window
+            recent_positive = any(det for t, det in self._face_presence_history)
+            if not recent_positive:
+                face_detected = False
+            else:
+                face_detected = self.user_state.get("face_detected", True)
+
+        if not has_raw_face:
             with self._lock:
-                self.user_state["face_detected"] = False
+                if not face_detected:
+                    self.user_state.update({
+                        "face_detected": False,
+                        "squinting": False,
+                        "leaning_forward": False,
+                        "looking_down": False,
+                        "hand_detected": hand_detected,
+                        "squint_confidence": 0.0,
+                        "lean_confidence": 0.0,
+                        "tremor_confidence": 0.0,
+                        "face_confidence": 0.0,
+                        "hand_confidence": 1.0 if hand_detected else 0.0,
+                    })
+                    self._squint_candidate_count = 0
+                    self._lean_candidate_count = 0
+                else:
+                    self.user_state["face_detected"] = True
+                    self.user_state["hand_detected"] = hand_detected
                 return self.user_state.copy()
-
-        image = cv2.flip(image, 1)
-        image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=image_rgb)
-
-        detection_result = self.detector.detect(mp_image)
-
-        if not detection_result.face_landmarks:
-            with self._lock:
-                self.user_state["face_detected"] = False
-                return self.user_state.copy()
-
-        landmarks = detection_result.face_landmarks[0]
 
         # --- Face geometry ---
         left_cheek  = landmarks[234]
@@ -80,29 +256,21 @@ class OverlayVision:
         face_width  = abs(left_cheek.x - right_cheek.x)
         face_height = abs(forehead.y  - chin.y)
 
-        # Initialise or periodically recalibrate baselines
-        self._frames_since_recal += 1
-        if self._baseline_face_width < 0.01 or self._frames_since_recal >= self.BASELINE_RECAL_INTERVAL:
-            self._baseline_face_width  = face_width
-            self._baseline_face_height = face_height if face_height > 0.01 else self._baseline_face_height
-            self._frames_since_recal   = 0
+        # Smooth face width over rolling window (3 frames ~ 1.0 second at 0.35s polling)
+        self._face_width_history.append(face_width)
+        if len(self._face_width_history) > 3:
+            self._face_width_history.pop(0)
+        smoothed_width = sum(self._face_width_history) / len(self._face_width_history)
 
-        # 1. Leaning-forward detection (face appears larger than baseline)
-        is_leaning = face_width > (self._baseline_face_width * 1.25)
-
-        # 2. Head pitch estimation — baseline-relative approach.
-        #    The nose tip (#1) is ALWAYS below the nose bridge (#6) anatomically,
-        #    so we can't use a fixed threshold.  Instead we calibrate the
-        #    "straight-ahead" pitch when the face first appears, then flag
-        #    "looking down" only when pitch exceeds baseline + delta.
+        # 1. Head pitch estimation (nose tip #1 vs nose bridge #6)
         nose_tip    = landmarks[1]
         nose_bridge = landmarks[6]
         pitch_delta = nose_tip.y - nose_bridge.y          # always positive
         norm_pitch  = pitch_delta / face_height if face_height > 0.01 else 0
 
-        # Smooth pitch over 6 frames to avoid flicker
+        # Smooth pitch over 4 frames to avoid flicker
         self._pitch_history.append(norm_pitch)
-        if len(self._pitch_history) > 6:
+        if len(self._pitch_history) > 4:
             self._pitch_history.pop(0)
         smoothed_pitch = sum(self._pitch_history) / len(self._pitch_history)
 
@@ -111,61 +279,109 @@ class OverlayVision:
             self._baseline_pitch = smoothed_pitch
             print(f"[Vision] Baseline pitch calibrated: {self._baseline_pitch:.4f}")
 
-        # Flag looking-down only when pitch exceeds baseline by >0.08
-        is_looking_down = (self._baseline_pitch > 0.01
-                           and smoothed_pitch > self._baseline_pitch + 0.08)
+        # 2. Iris Vertical Gaze Tracking (landmarks 468 left, 473 right)
+        left_gaze_y = 0.5
+        right_gaze_y = 0.5
+        if len(landmarks) > 468:
+            lid_h = landmarks[145].y - landmarks[159].y
+            if abs(lid_h) > 0.001:
+                left_gaze_y = (landmarks[468].y - landmarks[159].y) / lid_h
 
-        # Debug: log values for the first 40 frames to help with tuning
-        self._debug_frame_count += 1
-        if self._debug_frame_count <= 40:
-            print(f"[Vision] frame {self._debug_frame_count}: "
-                  f"pitch={norm_pitch:.4f} sm_pitch={smoothed_pitch:.4f} "
-                  f"bsl_pitch={self._baseline_pitch:.4f} down={is_looking_down}")
+        if len(landmarks) > 473:
+            lid_h = landmarks[374].y - landmarks[386].y
+            if abs(lid_h) > 0.001:
+                right_gaze_y = (landmarks[473].y - landmarks[386].y) / lid_h
 
-        # 3. Squinting detection — BASELINE-RELATIVE approach
-        #    Instead of a fixed threshold, we calibrate the user's normal eye
-        #    openness from the first ~15 frames and then detect squinting when
-        #    the smoothed eye gap drops below 70% of their personal baseline.
-        #    Average BOTH eyes (left: 159/145, right: 386/374) for robustness.
-        left_eye_gap  = abs(landmarks[159].y - landmarks[145].y)
-        right_eye_gap = abs(landmarks[386].y - landmarks[374].y)
-        eye_gap = (left_eye_gap + right_eye_gap) / 2
+        avg_gaze_y = (left_gaze_y + right_gaze_y) / 2
 
-        # Rolling 10-frame average to prevent single-blink false positives
-        self._eye_history.append(eye_gap)
-        if len(self._eye_history) > 10:
-            self._eye_history.pop(0)
-        smoothed_gap = sum(self._eye_history) / len(self._eye_history)
+        # Flag looking-down if iris is depressed towards bottom lid (>0.62) OR head is pitched down
+        is_looking_down = (avg_gaze_y > 0.62) or (
+            self._baseline_pitch > 0.01 and smoothed_pitch > self._baseline_pitch + 0.07
+        )
 
-        norm_gap = smoothed_gap / face_height if face_height > 0.01 else smoothed_gap
+        # 3. Robust Face Width Baseline Calibration (median of 6 stable forward-facing samples ~ 2 seconds)
+        if self._baseline_face_width < 0.01 and not is_looking_down and (0.10 < face_width < 0.40):
+            self._face_width_calibration_buf.append(smoothed_width)
+            if len(self._face_width_calibration_buf) >= 6:
+                sorted_widths = sorted(self._face_width_calibration_buf)
+                self._baseline_face_width = sorted_widths[len(sorted_widths) // 2]
+                print(f"[Vision] Baseline face width calibrated (median): {self._baseline_face_width:.4f}")
 
-        # Calibrate baseline eye openness from first 15 stable readings
-        if self._baseline_eye_gap < 0.001 and not is_looking_down:
-            self._eye_calibration_buf.append(norm_gap)
-            if len(self._eye_calibration_buf) >= 15:
-                # Use the median to be robust against blinks during calibration
-                sorted_buf = sorted(self._eye_calibration_buf)
-                self._baseline_eye_gap = sorted_buf[len(sorted_buf) // 2]
-                print(f"[Vision] Baseline eye openness calibrated: {self._baseline_eye_gap:.4f}")
+        # Leaning-forward detection with hysteresis
+        if self._baseline_face_width > 0.01:
+            ratio = smoothed_width / self._baseline_face_width
+            if ratio > 1.28:
+                self._lean_candidate_count += 1
+            elif ratio < 1.18:
+                self._lean_candidate_count = max(0, self._lean_candidate_count - 1)
 
-        # Determine squinting: eye gap < 70% of baseline, gated on neutral pitch
-        if self._baseline_eye_gap > 0.001:
-            squint_ratio = norm_gap / self._baseline_eye_gap
-            is_squinting = squint_ratio < 0.70 and not is_looking_down
+            is_leaning = (self._lean_candidate_count >= 1 and ratio > 1.28)
         else:
-            # Not yet calibrated — don't flag squinting
+            is_leaning = False
+
+        # 4. Scale-Invariant Eye Aspect Ratio (EAR)
+        # Left eye: 159 (upper), 145 (lower), 33 (outer), 133 (inner)
+        left_v = math.hypot(landmarks[159].x - landmarks[145].x, landmarks[159].y - landmarks[145].y)
+        left_h = math.hypot(landmarks[33].x - landmarks[133].x, landmarks[33].y - landmarks[133].y)
+        left_ear = left_v / left_h if left_h > 0.001 else 0.0
+
+        # Right eye: 386 (upper), 374 (lower), 263 (outer), 362 (inner)
+        right_v = math.hypot(landmarks[386].x - landmarks[374].x, landmarks[386].y - landmarks[374].y)
+        right_h = math.hypot(landmarks[263].x - landmarks[362].x, landmarks[263].y - landmarks[362].y)
+        right_ear = right_v / right_h if right_h > 0.001 else 0.0
+
+        current_ear = (left_ear + right_ear) / 2
+
+        # Rolling 3-frame average (~1.0s) for responsive yet stable tracking
+        self._ear_history.append(current_ear)
+        if len(self._ear_history) > 3:
+            self._ear_history.pop(0)
+        smoothed_ear = sum(self._ear_history) / len(self._ear_history)
+
+        # Calibrate baseline EAR from stable forward-looking readings (not looking down, ~2.0s)
+        if self._baseline_ear < 0.001 and not is_looking_down and current_ear > 0.15:
+            self._eye_calibration_buf.append(current_ear)
+            if len(self._eye_calibration_buf) >= 6:
+                sorted_buf = sorted(self._eye_calibration_buf)
+                self._baseline_ear = sorted_buf[len(sorted_buf) // 2]
+                print(f"[Vision] Baseline EAR calibrated: {self._baseline_ear:.4f}")
+
+        # Determine squinting:
+        # Natural squint threshold: < 0.77 of baseline (comfortable, no forced squeezing)
+        # Gated on NOT looking down, not a blink
+        if self._baseline_ear > 0.001:
+            squint_ratio = smoothed_ear / self._baseline_ear
+            is_squint_candidate = (0.25 <= squint_ratio < 0.77) and not is_looking_down
+            is_squinting = is_squint_candidate
+            eye_openness = min(smoothed_ear / self._baseline_ear, 1.0)
+        else:
             squint_ratio = 1.0
             is_squinting = False
+            eye_openness = 1.0
+
+        self._debug_frame_count += 1
 
         with self._lock:
             self.user_state.update({
                 "face_detected": True,
                 "squinting": is_squinting,
                 "looking_down": is_looking_down,
-                "leaning_forward": is_leaning
+                "leaning_forward": is_leaning,
+                "ear": smoothed_ear,
+                "eye_openness": eye_openness,
+                "gaze_y": avg_gaze_y,
+                "hand_detected": hand_detected,
+                "squint_confidence": 1.0 if is_squinting else 0.0,
+                "lean_confidence": 1.0 if is_leaning else 0.0,
+                "tremor_confidence": (
+                    1.0 if hand_detected and self.user_state.get("hand_tremor", 0.0) > 0.35 else 0.0
+                ),
+                "face_confidence": min(1.0, self._consecutive_detections / 4.0),
+                "hand_confidence": 1.0 if hand_detected else 0.0,
             })
             return self.user_state.copy()
 
     def release(self):
         self.cap.release()
+
 

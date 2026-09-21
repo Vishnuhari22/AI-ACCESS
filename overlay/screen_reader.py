@@ -105,6 +105,13 @@ CRITICAL RULES FOR DROPDOWNS AND AUTOCOMPLETE:
 - Set follow_up to null when no second action is needed (most cases — buttons, links, etc.).
 - For DATE PICKERS: click the date input field. Use press_keys to navigate if needed.
 - NEVER guess how many arrow-down presses are needed for a dropdown — you cannot see the options.
+
+RESPONSES TO PROACTIVE ASSISTANT OFFERS:
+- If a "Recent Assistant Prompt" was provided (e.g. offering to read the screen aloud or offering voice navigation), and the user responds affirmatively (e.g. "yes", "yeah", "please", "read it", "sure", "ok", "go ahead"):
+  - If the assistant offered to read the screen: in `speech_response`, read aloud the key information, headings, prompts, or choices currently displayed on screen clearly and warmly.
+  - If the assistant offered voice navigation: in `speech_response`, describe the primary choices available and ask what they would like to select.
+- If the user responds negatively (e.g. "no", "no thanks", "cancel", "I'm good"):
+  - In `speech_response`, reply politely (e.g. "No problem, let me know if you need any help.") and leave selected_targets as [].
 """
 
 # Gemini models to try in order (flash/lite only — Pro is no longer free tier)
@@ -236,7 +243,8 @@ def _normalise_response(parsed: dict) -> dict:
 
 def analyze_screen_and_intent(screenshot: Image.Image,
                                user_voice_text: str,
-                               user_state: dict) -> dict | None:
+                               user_state: dict,
+                               prior_context: str = "") -> dict | None:
     """Sends screenshot + voice text to Gemini Vision and returns parsed JSON."""
     if _client is None:
         print("[ScreenReader] No Gemini client — API key missing.")
@@ -251,8 +259,10 @@ def analyze_screen_and_intent(screenshot: Image.Image,
         SYSTEM_PROMPT,
         types.Part.from_bytes(data=image_bytes, mime_type="image/png"),
         f"User State Context: {json.dumps(user_state)}",
-        f"User Voice Request: '{user_voice_text}'",
     ]
+    if prior_context:
+        contents.append(f"Recent Assistant Prompt: '{prior_context}'")
+    contents.append(f"User Voice Request / Response: '{user_voice_text}'")
 
     last_error = None
     for model_name in _MODEL_PRIORITY:

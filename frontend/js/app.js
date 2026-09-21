@@ -78,67 +78,95 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // ─── Gather current user state from all controls ───
     function gatherUserState() {
-        const flags = [];
-        document.querySelectorAll('.behavior-flag:checked').forEach(cb => flags.push(cb.value));
+        const flags = new Set();
 
-        // Include latest vision perception signals
+        document
+            .querySelectorAll('.behavior-flag:checked')
+            .forEach(cb => flags.add(cb.value));
+
+        // Camera observations are signals, not capability values.
         const vs = visionAnalyzer.signals || {};
 
+        if (vs.squinting) {
+            flags.add('squinting');
+        }
+
+        if (vs.leaning_forward) {
+            flags.add('leaning_forward');
+        }
+
+        if (vs.hand_detected && vs.hand_tremor > 0.35) {
+            flags.add('hand_tremor');
+        }
+
         return {
-            visual_capability:  parseFloat(sliders.visual_capability.value),
-            motor_capability:   parseFloat(sliders.motor_capability.value),
-            cognitive_load:     parseFloat(sliders.cognitive_load.value),
-            frustration_level:  parseFloat(sliders.frustration_level.value),
-            interaction_speed:  selectEls.interaction_speed.value,
-            age_group:          selectEls.age_group.value,
-            preferred_language: selectEls.preferred_language.value,
-            behavioral_flags:   flags,
-            hand_tremor:        vs.hand_tremor || 0,
-            wheelchair_detected: vs.wheelchair_detected || false,
-            bystander_present:  vs.bystander_present || false,
-            estimated_age:      vs.estimated_age || 'adult',
+            visual_capability:
+                parseFloat(sliders.visual_capability.value),
+
+            motor_capability:
+                parseFloat(sliders.motor_capability.value),
+
+            cognitive_load:
+                parseFloat(sliders.cognitive_load.value),
+
+            frustration_level:
+                parseFloat(sliders.frustration_level.value),
+
+            interaction_speed:
+                selectEls.interaction_speed.value,
+
+            age_group: 
+                selectEls.age_group.value,
+
+            preferred_language:
+                selectEls.preferred_language.value,
+
+            behavioral_flags:
+                [...flags],
+
+            hand_tremor:
+                vs.hand_tremor || 0,
+
+            looking_down:
+                vs.looking_down || false,
+
+            gaze_direction:
+                vs.gaze_direction || 'center',
+
+            wheelchair_detected:
+                vs.wheelchair_detected || false,
+
+            bystander_present:
+                vs.bystander_present || false,
+
+            estimated_age:
+                vs.estimated_age || 'adult',
+
+            // Perception confidence is preserved in the canonical state.
+            squint_confidence:
+                Number(vs.squint_confidence || 0),
+
+            lean_confidence:
+                Number(vs.lean_confidence || 0),
+
+            tremor_confidence:
+                Number(vs.tremor_confidence || 0),
+
+            face_confidence:
+                Number(vs.face_confidence || 0),
+
+            hand_confidence:
+                Number(vs.hand_confidence || 0),
         };
     }
 
     function sendUserStateUpdate() {
         const state = gatherUserState();
-        wsClient.send({ type: "user_state_update", data: state });
-        
-        // ─── DIRECT UI adaptation based on slider values ───
-        const kioskFrame = document.querySelector('.kiosk-frame');
-        const kioskScreenEl = document.getElementById('kiosk-screen');
 
-        // Visual capability → font scaling + contrast
-        if (state.visual_capability < 0.4) {
-            kioskScreenEl.style.fontSize = '1.8rem';
-            kioskFrame.classList.add('contrast-high_contrast');
-            kioskFrame.classList.remove('contrast-normal', 'contrast-dark');
-        } else if (state.visual_capability < 0.7) {
-            kioskScreenEl.style.fontSize = '1.3rem';
-            kioskFrame.classList.remove('contrast-high_contrast', 'contrast-dark');
-        } else {
-            kioskScreenEl.style.fontSize = '';
-            kioskFrame.classList.remove('contrast-high_contrast', 'contrast-dark');
-        }
-
-        // Motor capability → simplified layout
-        if (state.motor_capability < 0.4) {
-            kioskFrame.classList.add('layout-simplified');
-        } else {
-            kioskFrame.classList.remove('layout-simplified');
-        }
-
-        // Accessibility status indicator
-        if (state.visual_capability < 0.4 || state.motor_capability < 0.4 || 
-            state.cognitive_load > 0.6 || state.frustration_level > 0.5) {
-            accessibilityStatus.textContent = '⚡ Adapted';
-            accessibilityStatus.style.background = 'rgba(245, 158, 11, 0.2)';
-            accessibilityStatus.style.color = '#f59e0b';
-        } else {
-            accessibilityStatus.textContent = 'Ready';
-            accessibilityStatus.style.background = '';
-            accessibilityStatus.style.color = '';
-        }
+        wsClient.send({
+            type: "user_state_update",
+            data: state
+        });
     }
 
     // ─── Voice System ───
@@ -175,19 +203,156 @@ document.addEventListener('DOMContentLoaded', () => {
     );
 
     // ─── Vision Analyzer (Webcam) ───
-    // Track when user last manually changed a slider (for manual override cooldown)
+
+    // Track when user last manually changed a slider
     const _sliderManualTimestamps = {};
 
-    // Hysteresis: require N consecutive stable readings before applying vision adaptation
-    let _visionHysteresis = { level: 'normal', count: 0, threshold: 6 };
+    // ─── Proactive Empathetic Voice Assistant ───
+    // Uses the same AccessibilityPolicy decision as the backend/overlay.
+    // Perception supplies observations; policy decides when assistance is needed.
+    let _latestAccessibilityDecision = {};
+    let _latestVisionSignals = {};
+    let _proactiveCooldownUntil = 0;
+    let _proactiveTremorStart = 0;
+    let _proactiveVisionStart = 0;
+    let _lastTremorSeen = 0;
+    let _lastVisionNeedSeen = 0;
 
+    function triggerEmpatheticPrompt(text) {
+        const now = Date.now();
+        if (now < _proactiveCooldownUntil) return;
+
+        _proactiveCooldownUntil = now + 60000;
+        addLog(`💬 Empathetic assist: "${text}"`, 'rx');
+        addConversationBubble('agent', text);
+
+        // Keep the prompt in the backend conversation history, matching the overlay.
+        if (wsClient) {
+            wsClient.send({ type: 'empathetic_prompt_logged', text });
+        }
+
+        voiceSystem.speak(text, 'en-IN', () => {
+            setTimeout(() => {
+                voiceSystem.startListening();
+
+                setTimeout(() => {
+                    voiceSystem.stopListening();
+                }, 5000);
+            }, 100);
+        });
+    }
+
+    function updateProactiveVoiceMonitor(signals, decision) {
+        _latestVisionSignals = signals || {};
+        _latestAccessibilityDecision = decision || _latestAccessibilityDecision;
+
+        if (!_latestVisionSignals.face_detected) {
+            _proactiveTremorStart = 0;
+            _proactiveVisionStart = 0;
+            return;
+        }
+
+        const now = Date.now();
+        if (now < _proactiveCooldownUntil) return;
+
+        const tremorNeed = !!_latestAccessibilityDecision.tremor_need;
+        const visualNeed = !!_latestAccessibilityDecision.visual_need;
+
+        if (tremorNeed) {
+            _lastTremorSeen = now;
+            if (!_proactiveTremorStart) _proactiveTremorStart = now;
+            if (now - _proactiveTremorStart >= 2500) {
+                triggerEmpatheticPrompt(
+                    'I noticed some hand tremor. Would you like me to navigate by voice for you?'
+                );
+                _proactiveTremorStart = 0;
+                return;
+            }
+        } else if (now - _lastTremorSeen > 800) {
+            _proactiveTremorStart = 0;
+        }
+
+        if (visualNeed) {
+            _lastVisionNeedSeen = now;
+            if (!_proactiveVisionStart) _proactiveVisionStart = now;
+            if (now - _proactiveVisionStart >= 2500) {
+                triggerEmpatheticPrompt(
+                    `I noticed you're looking closely. Would you like me to read the screen aloud?`
+                );
+                _proactiveVisionStart = 0;
+            }
+        } else if (now - _lastVisionNeedSeen > 1000) {
+            _proactiveVisionStart = 0;
+        }
+    }
+
+    // Camera observations can arrive frequently.
+    // We only send meaningful camera-state changes to the backend.
+    let _lastVisionStateSignature = '';
+    let _lastVisionStateSentAt = 0;
+
+    const VISION_STATE_SEND_INTERVAL_MS = 300;
+
+    function sendVisionStateUpdate(force = false) {
+        // wsClient is declared later in this file. This function runs from
+        // asynchronous camera callbacks, but the guard also protects
+        // unusual startup timing.
+        if (typeof wsClient === 'undefined' || !wsClient) {
+            return;
+        }
+
+        const state = gatherUserState();
+
+        const signature = JSON.stringify({
+            behavioral_flags: state.behavioral_flags,
+            hand_tremor: Number(state.hand_tremor.toFixed(2)),
+            squint_confidence:
+                Number(state.squint_confidence.toFixed(2)),
+            lean_confidence:
+                Number(state.lean_confidence.toFixed(2)),
+            tremor_confidence:
+                Number(state.tremor_confidence.toFixed(2)),
+            looking_down: state.looking_down,
+            gaze_direction: state.gaze_direction,
+            wheelchair_detected: state.wheelchair_detected,
+            bystander_present: state.bystander_present,
+            estimated_age: state.estimated_age
+        });
+
+        const now = Date.now();
+
+        // Do not resend identical camera state just because the timer
+        // elapsed. Send only when meaningful perception state changes.
+        if (!force && signature === _lastVisionStateSignature) {
+            return;
+        }
+
+        // Still rate-limit rapidly changing camera signals.
+        if (
+            !force &&
+            now - _lastVisionStateSentAt <
+                VISION_STATE_SEND_INTERVAL_MS
+        ) {
+            return;
+        }
+
+        _lastVisionStateSignature = signature;
+        _lastVisionStateSentAt = now;
+
+        wsClient.send({
+            type: "user_state_update",
+            data: state
+        });
+    }
     const visionAnalyzer = new VisionAnalyzer((signals) => {
         // Update signal display tags
         sigFace.textContent = signals.face_detected ? '✅ Face' : '❌ No Face';
         sigFace.className = `signal-tag ${signals.face_detected ? 'active' : ''}`;
 
-        sigEyes.textContent = signals.squinting ? '👁️ Squinting!' : '👁️ Eyes OK';
-        sigEyes.className = `signal-tag ${signals.squinting ? 'warning' : ''}`;
+        sigEyes.textContent = signals.squinting 
+            ? '👁️ Squinting!' 
+            : (signals.looking_down ? '👁️ Looking Down' : '👁️ Eyes OK');
+        sigEyes.className = `signal-tag ${signals.squinting ? 'warning' : (signals.looking_down ? 'active' : '')}`;
 
         const distLabel = signals.leaning_forward ? '↗️ Leaning!' : '↗️ Normal';
         sigDistance.textContent = distLabel;
@@ -195,8 +360,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
         // ── New perception signals ──
         const tremorPct = Math.round((signals.hand_tremor || 0) * 100);
-        sigTremor.textContent = `✋ Tremor: ${tremorPct}%`;
-        sigTremor.className = `signal-tag ${tremorPct > 30 ? 'warning' : ''}`;
+        if (signals.hand_detected) {
+            sigTremor.textContent = `✋ Tremor: ${tremorPct}%`;
+            sigTremor.className = `signal-tag ${tremorPct > 35 ? 'warning' : 'active'}`;
+        } else {
+            sigTremor.textContent = `✋ Hand: None`;
+            sigTremor.className = `signal-tag`;
+        }
 
         sigWheelchair.textContent = signals.wheelchair_detected ? '♿ Wheelchair: YES' : '♿ Wheelchair: No';
         sigWheelchair.className = `signal-tag ${signals.wheelchair_detected ? 'active' : ''}`;
@@ -207,68 +377,33 @@ document.addEventListener('DOMContentLoaded', () => {
         sigAge.textContent = `👤 Age: ${signals.estimated_age || 'adult'}`;
         sigAge.className = `signal-tag`;
 
-        if (!signals.face_detected) return;
+        if (!signals.face_detected) {
+            const squintFlag = document.getElementById('flag-squinting');
+            const leanFlag = document.getElementById('flag-leaning');
+            const tremorFlag = document.querySelector('input.behavior-flag[value="hand_tremor"]');
+
+            if (squintFlag) squintFlag.checked = false;
+            if (leanFlag) leanFlag.checked = false;
+            if (tremorFlag) tremorFlag.checked = false;
+
+            // Clear stale camera observations in backend state.
+            sendVisionStateUpdate(true);
+
+            return;
+        }
 
         // Auto-update behavioral flag checkboxes
         const squintFlag = document.getElementById('flag-squinting');
         const leanFlag = document.getElementById('flag-leaning');
+        const tremorFlag = document.querySelector('input.behavior-flag[value="hand_tremor"]');
         if (squintFlag) squintFlag.checked = signals.squinting;
         if (leanFlag) leanFlag.checked = signals.leaning_forward;
+        if (tremorFlag) tremorFlag.checked = (signals.hand_detected && signals.hand_tremor > 0.4);
 
-        // ─── Compute target adaptation level with HYSTERESIS ───
-        let targetLevel = 'normal';
-        if (signals.squinting && signals.leaning_forward) targetLevel = 'full';
-        else if (signals.squinting) targetLevel = 'visual';
-        else if (signals.leaning_forward) targetLevel = 'motor';
-
-        if (targetLevel === _visionHysteresis.level) {
-            _visionHysteresis.count++;
-        } else {
-            _visionHysteresis.level = targetLevel;
-            _visionHysteresis.count = 1;
-        }
-
-        // Only apply slider changes after stable for 6 consecutive readings (~3s)
-        if (_visionHysteresis.count < _visionHysteresis.threshold) return;
-
-        const MANUAL_COOLDOWN_MS = 10000;
-
-        // ─── AUTO-ADJUST SLIDERS from camera signals ───
-        let targetVisual = 1.0;
-        if (signals.squinting) {
-            targetVisual = 0.2;
-        } else if (signals.leaning_forward) {
-            targetVisual = 0.3;
-        }
-
-        // Motor capability from tremor
-        if (signals.hand_tremor > 0.5) {
-            const motorManualTime = _sliderManualTimestamps['motor_capability'] || 0;
-            if (Date.now() - motorManualTime >= MANUAL_COOLDOWN_MS) {
-                const currentMotor = parseFloat(sliders.motor_capability.value);
-                const targetMotor = 0.3;
-                if (Math.abs(currentMotor - targetMotor) > 0.05) {
-                    sliders.motor_capability.value = targetMotor.toString();
-                    sliderValEls.motor_capability.textContent = targetMotor.toFixed(1);
-                    addLog(`📷 Camera → High tremor detected, Motor Capability set to ${targetMotor}`, 'rx');
-                    sendUserStateUpdate();
-                }
-            }
-        }
-
-        // Visual capability — respect manual cooldown
-        const visualManualTime = _sliderManualTimestamps['visual_capability'] || 0;
-        if (Date.now() - visualManualTime >= MANUAL_COOLDOWN_MS) {
-            const currentVisual = parseFloat(sliders.visual_capability.value);
-            if (Math.abs(currentVisual - targetVisual) > 0.05) {
-                sliders.visual_capability.value = targetVisual.toString();
-                sliderValEls.visual_capability.textContent = targetVisual.toFixed(1);
-                if (targetVisual < 0.5) {
-                    addLog(`📷 Camera → Visual Capability set to ${targetVisual}`, 'rx');
-                }
-                sendUserStateUpdate();
-            }
-        }
+        // Camera only supplies observations.
+        // AccessibilityPolicy on the backend decides the adaptation.
+        sendVisionStateUpdate();
+        updateProactiveVoiceMonitor(signals, _latestAccessibilityDecision);
     });
 
     let webcamActive = false;
@@ -296,7 +431,36 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     });
 
+    // ─── Handle deterministic accessibility policy update ───
+    function handleAccessibilityUpdate(data) {
+        const decision = data.decision;
+        _latestAccessibilityDecision = decision || {};
+
+        if (!decision || !decision.adaptation) {
+            return;
+        }
+
+        addLog(
+            `♿ Accessibility policy → ${decision.accessibility_level}`,
+            'rx'
+        );
+
+        applyUIAdaptation(decision.adaptation);
+        updateProactiveVoiceMonitor(_latestVisionSignals, decision);
+
+        if (decision.needs_accessibility_boost) {
+            accessibilityStatus.textContent = '⚡ Adapted';
+            accessibilityStatus.style.background = 'rgba(245, 158, 11, 0.2)';
+            accessibilityStatus.style.color = '#f59e0b';
+        } else {
+            accessibilityStatus.textContent = 'Ready';
+            accessibilityStatus.style.background = '';
+            accessibilityStatus.style.color = '';
+        }
+    }
+
     // ─── Process LLM Agent Response ───
+
     function handleAgentResponse(data) {
         accessibilityStatus.textContent = 'Ready';
         accessibilityStatus.classList.remove('thinking');
@@ -319,8 +483,10 @@ document.addEventListener('DOMContentLoaded', () => {
                     voiceSystem.speak(action.text, action.language || 'en-IN');
                     break;
                 case 'ui_adaptation':
-                    addLog(`🎨 UI Adapt: ${JSON.stringify(action.adaptations)}`, 'rx');
-                    applyUIAdaptation(action.adaptations);
+                    addLog(
+                        '⚠️ Ignoring LLM UI adaptation; AccessibilityPolicy is authoritative.',
+                        'info'
+                    );
                     break;
                 case 'kiosk_command':
                     addLog(`⚙️ Kiosk: ${action.command} → ${action.target_screen || ''}`, 'rx');
@@ -375,11 +541,17 @@ document.addEventListener('DOMContentLoaded', () => {
                 const data = JSON.parse(message);
                 if (data.type === 'agent_response') {
                     handleAgentResponse(data);
+
+                } else if (data.type === 'accessibility_update') {
+                    handleAccessibilityUpdate(data);
+
                 } else if (data.type === 'kiosk_screen_update') {
                     handleKioskScreenUpdate(data);
+
                 } else if (data.type === 'agent_speech') {
                     addLog(`Agent: "${data.text}"`, 'rx');
                     voiceSystem.speak(data.text);
+
                 } else {
                     addLog(`Unknown: ${message.substring(0, 80)}`, 'info');
                 }
@@ -394,6 +566,16 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     );
     wsClient.connect();
+
+    // Background inactivity check — mirrors the overlay's 30s proactive nudge.
+    setInterval(() => {
+        if (!_latestVisionSignals.face_detected) return;
+        if (Date.now() < _proactiveCooldownUntil) return;
+        const inactivity = Date.now() - (window._lastInteractionTime || Date.now());
+        if (inactivity > 30000) {
+            triggerEmpatheticPrompt(`I'm here if you need any help. Would you like me to guide you through the screen?`);
+        }
+    }, 1000);
 
     // ─── Event Listeners ───
     micBtn.addEventListener('click', () => {

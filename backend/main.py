@@ -12,6 +12,7 @@ import uvicorn
 from config import settings
 from perception.asr_handler import ASRHandler
 from modeling.temporal_decay import decay_user_state
+from modeling.accessibility_policy import AccessibilityPolicy
 from orchestrator.context_bundle import ContextBundleAssembler
 from orchestrator.llm_client import call_llm
 from session.session_manager import SessionManager
@@ -82,8 +83,38 @@ async def websocket_endpoint(websocket: WebSocket):
             
             # ─── Handle user state updates from control panel sliders ───
             if msg_type == "user_state_update":
-                session.user_state.update_from_frontend(payload.get("data", {}))
-                logger.info(f"User state updated: visual={session.user_state.visual_capability}, motor={session.user_state.motor_capability}")
+                state_data = payload.get("data", {})
+
+                # Update canonical state.
+                session.user_state.update_from_frontend(state_data)
+
+                # Evaluate accessibility using the single deterministic policy.
+                accessibility = AccessibilityPolicy.evaluate(
+                    session.user_state
+                )
+
+                logger.info(
+                    "User state updated: "
+                    f"visual={session.user_state.visual_capability:.2f}, "
+                    f"motor={session.user_state.motor_capability:.2f}, "
+                    f"flags={session.user_state.behavioral_flags}, "
+                    f"tremor={session.user_state.hand_tremor:.2f}, "
+                    f"adaptation={accessibility['accessibility_level']}"
+                )
+
+                # Send the decision back to the web renderer.
+                await websocket.send_text(json.dumps({
+                    "type": "accessibility_update",
+                    "decision": accessibility
+                }))
+
+                continue
+
+            # ─── Handle empathetic proactive prompt logging ───
+            if msg_type == "empathetic_prompt_logged":
+                prompt_text = payload.get("text", "")
+                session.add_assistant_prompt(prompt_text)
+                logger.info(f"Empathetic prompt logged to conversation history: {prompt_text}")
                 continue
             
             # ─── Handle kiosk mode switch ───
@@ -155,7 +186,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 # 4. Assemble Context Bundle
                 context_bundle = ContextBundleAssembler.assemble(
                     user_transcript=processed["content"],
-                    user_state_dict=session.user_state.to_dict(),
+                    user_state=session.user_state,
                     kiosk_state=session.get_kiosk_state(),
                     conversation_history=session.conversation_history
                 )

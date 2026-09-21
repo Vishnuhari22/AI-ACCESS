@@ -37,6 +37,17 @@ class Session:
         # Keep last 20 entries (10 turns)
         if len(self.conversation_history) > 20:
             self.conversation_history = self.conversation_history[-20:]
+
+    def add_assistant_prompt(self, speech_text: str):
+        """Record proactive assistant prompts into conversation history so user replies have context."""
+        self.conversation_history.append({
+            "role": "assistant",
+            "reasoning": "Proactive empathetic assistance prompt",
+            "actions": [{"type": "speech_output", "text": speech_text}],
+            "timestamp": time.time()
+        })
+        if len(self.conversation_history) > 20:
+            self.conversation_history = self.conversation_history[-20:]
     
     def get_kiosk_state(self) -> dict:
         """Get current kiosk state for the Context Bundle."""

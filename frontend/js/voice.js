@@ -2,7 +2,7 @@ class UIAAVoiceSystem {
     constructor(onTranscriptCallback, onStateChangeCallback) {
         this.onTranscript = onTranscriptCallback;
         this.onStateChange = onStateChangeCallback; // e.g., 'listening', 'stopped', 'error'
-        
+        this._autoStopTimer = null;
         // ASR Support Check
         const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
         if (!SpeechRecognition) {
@@ -54,24 +54,42 @@ class UIAAVoiceSystem {
     }
 
     startListening() {
+        if (this._autoStopTimer) {
+            clearTimeout(this._autoStopTimer);
+            this._autoStopTimer = null;
+        }
         if (this.recognition) {
             try {
                 this.recognition.start();
             } catch (e) {
-                console.error("Could not start recognition", e);
+                // If recognition is already started, restart it cleanly
+                try {
+                    this.recognition.stop();
+                    setTimeout(() => {
+                        try { this.recognition.start(); } catch (err) {}
+                    }, 150);
+                } catch (err) {}
             }
         }
     }
 
     stopListening() {
+        if (this._autoStopTimer) {
+            clearTimeout(this._autoStopTimer);
+            this._autoStopTimer = null;
+        }
+
         if (this.recognition) {
-            this.recognition.stop();
+            try {
+                this.recognition.stop();
+            } catch (e) {}
         }
     }
 
-    speak(text, lang = 'en-IN') {
+    speak(text, lang = 'en-IN', onEnd = null) {
         if (!this.synth) {
             console.error("Speech Synthesis not supported");
+            if (onEnd) onEnd();
             return;
         }
 
@@ -81,6 +99,25 @@ class UIAAVoiceSystem {
         const utterance = new SpeechSynthesisUtterance(text);
         utterance.lang = lang;
         utterance.rate = 1.0; 
+
+        // Store reference on window to prevent Chrome GC bug dropping onend
+        window._activeUtterance = utterance;
+
+        if (onEnd) {
+            let triggered = false;
+            const finish = () => {
+                if (!triggered) {
+                    triggered = true;
+                    onEnd();
+                }
+            };
+            utterance.onend = finish;
+            utterance.onerror = finish;
+            // Fallback timeout: guarantees callback runs even if browser drops onend
+            const wordCount = (text || "").split(/\s+/).length;
+            const timeoutMs = Math.max(1500, (wordCount / 2.5) * 1000 + 400);
+            setTimeout(finish, timeoutMs);
+        }
         
         this.synth.speak(utterance);
     }

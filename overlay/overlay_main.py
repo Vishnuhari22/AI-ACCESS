@@ -1,4 +1,6 @@
 import ctypes
+from backend.modeling.accessibility_policy import AccessibilityPolicy
+from backend.modeling.user_state import UserStateVector
 # Crucial fix for Windows 10/11 Scaling: Prevents pyautogui from missing targets on zoomed screens
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(2)
@@ -14,13 +16,13 @@ import threading
 import time
 from datetime import datetime
 
-from screen_reader import (capture_screen, analyze_screen_and_intent,
+from .screen_reader import (capture_screen, analyze_screen_and_intent,
                           analyze_follow_up, verify_anchor, analyze_proactive)
-from overlay_voice import OverlayVoice
-from overlay_vision import OverlayVision
-from overlay_adapter import inject_click, inject_text, inject_keys
-from proactive_monitor import ProactiveMonitor
-from escalation import EscalationManager, EscalationState
+from .overlay_voice import OverlayVoice
+from .overlay_vision import OverlayVision
+from .overlay_adapter import inject_click, inject_text, inject_keys
+from .proactive_monitor import ProactiveMonitor
+from .escalation import EscalationManager, EscalationState
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -100,10 +102,15 @@ class OverlayApp:
         self.monitor_info = None
         self._lock = threading.Lock()
         self._adaptation_level = AdaptationLevel.NORMAL
+        self._user_state = UserStateVector()
+        self._latest_accessibility_decision = AccessibilityPolicy.evaluate(
+            self._user_state
+        )
         self._cycle_had_error = False
         self._demo_mode = tk.BooleanVar(value=True)
         self._current_targets = []      # keep reference for re-rendering on adaptation change
         self._last_cycle_time = time.time()
+        self._last_empathetic_question = ""
 
         # --- Escalation Manager ---
         self._escalation = EscalationManager(
@@ -112,7 +119,7 @@ class OverlayApp:
         )
 
         # Hysteresis: require N consecutive readings before switching adaptation
-        self._HYSTERESIS_THRESHOLD = 6  # 6 × 0.5s = 3 seconds of stable signal
+        self._HYSTERESIS_THRESHOLD = 6  # 6 readings × ~0.08s = ~0.5 seconds for responsive, stable adaptation
         self._pending_level = AdaptationLevel.NORMAL
         self._pending_count = 0
 
@@ -329,10 +336,15 @@ class OverlayApp:
                 self._vision_dot.config(fg=Palette.ERROR)
 
         # Start Proactive Monitor
+        # IMPORTANT: Use cached user_state (not get_latest_state which grabs the camera)
+        # vision_loop already polls the camera; ProactiveMonitor just reads the latest result
         self._proactive = ProactiveMonitor(
-            get_state_fn=lambda: (self.vision.get_latest_state()
-                                  if self.vision else {}),
+            get_state_fn=lambda: (
+                self._get_proactive_state()
+                if self.vision else {}
+            ),
             trigger_fn=self._run_proactive_check,
+            empathetic_fn=self._run_empathetic_prompt,
             inactivity_threshold=30,
             frustration_threshold=10,
             cooldown=60,
@@ -364,20 +376,91 @@ class OverlayApp:
     # ══════════════════════════════════════════════════════════════════════
     # Adaptive UI System
     # ══════════════════════════════════════════════════════════════════════
+    def _evaluate_accessibility(self, state: dict) -> dict:
+        """Update canonical state from perception and evaluate the shared policy.
+
+        This is the desktop equivalent of the web backend's
+        ``UserStateVector -> AccessibilityPolicy.evaluate`` path.
+        Perception only supplies observations; this method does not invent
+        desktop-specific accessibility rules.
+        """
+        with self._lock:
+            self._user_state.update_behavioral_flags_from_observations(
+                squinting=bool(state.get("squinting", False)),
+                leaning_forward=bool(state.get("leaning_forward", False)),
+                hand_tremor=float(state.get("hand_tremor", 0.0) or 0.0),
+            )
+
+            # Confidence values come from the platform-specific perception
+            # module. They are consumed only by the shared policy.
+            for field in (
+                "squint_confidence",
+                "lean_confidence",
+                "tremor_confidence",
+                "face_confidence",
+                "hand_confidence",
+            ):
+                if field in state:
+                    setattr(
+                        self._user_state,
+                        field,
+                        max(0.0, min(1.0, float(state[field] or 0.0))),
+                    )
+
+            self._user_state.looking_down = bool(state.get("looking_down", False))
+            self._user_state.gaze_direction = str(state.get("gaze_direction", "center"))
+            self._user_state.wheelchair_detected = bool(state.get("wheelchair_detected", False))
+            self._user_state.bystander_present = bool(state.get("bystander_present", False))
+            self._user_state.estimated_age = str(state.get("estimated_age", "adult"))
+
+            decision = AccessibilityPolicy.evaluate(self._user_state)
+            self._latest_accessibility_decision = decision
+            return decision
+
     def _compute_adaptation_level(self, state: dict) -> str:
-        """Determine adaptation level from vision state."""
-        squinting = state.get("squinting", False)
-        leaning   = state.get("leaning_forward", False)
+        """Map the shared policy decision to the overlay's rendering modes."""
+        decision = self._evaluate_accessibility(state)
+        level = decision["accessibility_level"]
 
-        if squinting and leaning:
-            return AdaptationLevel.FULL
-        elif squinting:
-            return AdaptationLevel.VISUAL
-        elif leaning:
-            return AdaptationLevel.MOTOR
-        else:
-            return AdaptationLevel.NORMAL
+        # The policy is authoritative. The overlay only translates its
+        # abstract decision into concrete Tkinter rendering modes.
+        mapping = {
+            "normal": AdaptationLevel.NORMAL,
+            "visual": AdaptationLevel.VISUAL,
+            "motor": AdaptationLevel.MOTOR,
+            "full": AdaptationLevel.FULL,
+            # Support and motor both use the overlay's enlarged/simplified
+            # rendering primitives; the policy still remains authoritative.
+            "support": AdaptationLevel.MOTOR,
+        }
+        return mapping.get(level, AdaptationLevel.NORMAL)
+    def _get_proactive_state(self):
+        """
+        Return canonical state plus deterministic accessibility
+        decisions for ProactiveMonitor.
+        """
 
+        if self.vision:
+            with self.vision._lock:
+                vision_state = self.vision.user_state.copy()
+
+            # Do not run perception again or recompute policy here.
+            # vision_loop owns the perception -> canonical state -> policy
+            # pipeline; ProactiveMonitor only consumes its latest result.
+            with self._lock:
+                decision = dict(
+                    getattr(self, "_latest_accessibility_decision", {})
+                )
+                behavioral_flags = list(self._user_state.behavioral_flags)
+
+            return {
+                **vision_state,
+                "accessibility_decision": decision,
+                "behavioral_flags": behavioral_flags,
+            }
+
+        return {}
+    
     def _apply_adaptation(self, level: str):
         """Apply full UI adaptation based on the detected level.
 
@@ -509,20 +592,30 @@ class OverlayApp:
             # get_latest_state() has its own internal lock — no outer lock needed
             state = self.vision.get_latest_state()
 
+            # Hand indicator always evaluated
+            if state.get("hand_detected"):
+                hand_tremor = state.get("hand_tremor", 0.0) * 100
+                hand_info = f" | ✋ {hand_tremor:.0f}%"
+            else:
+                hand_info = " | ✋ None"
+
             if state["face_detected"]:
                 sq_text = "Squinting ⚠️" if state["squinting"] else "Normal"
                 ln_text = "Leaning ↗️" if state["leaning_forward"] else "Normal"
                 ld_text = " | 👇 Down" if state.get("looking_down") else ""
-                # Show eye calibration status
-                if self.vision._baseline_eye_gap > 0.001:
-                    eye_info = f" | 👁 {self.vision._baseline_eye_gap:.3f}"
+                # Show eye openness % if calibrated
+                baseline_ear = getattr(self.vision, "_baseline_ear", 0.0)
+                if baseline_ear > 0.001:
+                    eye_openness = state.get("eye_openness", 1.0) * 100
+                    eye_info = f" | 👁 {eye_openness:.0f}%"
                 else:
                     eye_info = " | 👁 cal…"
-                status = f"👁 {sq_text} | {ln_text}{ld_text}{eye_info}"
-                dot_color = Palette.WARNING if (state["squinting"] or state["leaning_forward"]) else Palette.SUCCESS
+                    
+                status = f"{sq_text} | {ln_text}{ld_text}{eye_info}{hand_info}"
+                dot_color = Palette.WARNING if (state["squinting"] or state["leaning_forward"] or (state.get("hand_detected") and state.get("hand_tremor", 0.0) > 0.35)) else Palette.SUCCESS
             else:
-                status = "No face detected"
-                dot_color = Palette.TEXT_DIM
+                status = f"No face{hand_info}"
+                dot_color = Palette.WARNING if (state.get("hand_detected") and state.get("hand_tremor", 0.0) > 0.35) else Palette.TEXT_DIM
 
             # Thread-safe Tkinter updates via root.after
             self.root.after(0, self._vision_status.set, status)
@@ -542,7 +635,7 @@ class OverlayApp:
                     self._pending_level != self._adaptation_level):
                 self.root.after(0, self._apply_adaptation, self._pending_level)
 
-            time.sleep(0.5)
+            time.sleep(0.08)
 
     # ══════════════════════════════════════════════════════════════════════
     # Activity Log
@@ -635,6 +728,56 @@ class OverlayApp:
 
     def _simulate_human_connect(self):
         self._escalation.simulate_human_connected()
+
+    def _run_empathetic_prompt(self, speech: str):
+        """Called by ProactiveMonitor for empathetic rule-based prompts (no LLM needed)."""
+        self._last_empathetic_question = speech
+        self._log(f"💬 Empathetic prompt: \"{speech}\"")
+        self._set_engine_status("Empathetic assist…", Palette.WARNING)
+
+        def _do_speak_and_listen():
+            try:
+                self.voice.speak(speech)
+
+                # Wait until empathetic speech has finished.
+                time.sleep(0.3)
+
+                self._log("🎤 Listening for your answer for 5 seconds...")
+                self._set_voice_status("Listening…", Palette.WARNING)
+
+                user_input, voice_error = self.voice.listen_sync(timeout=5)
+
+                if user_input:
+                    self._log(f"🗣 Heard: \"{user_input}\"")
+                    self._last_empathetic_question = speech
+
+                    # Process the user's answer normally.
+                    self.root.after(0, self._process_empathetic_response, user_input)
+                else:
+                    self._log("⏱ No response received within 5 seconds.")
+
+                self._set_voice_status("Ready", Palette.SUCCESS)
+
+            except Exception as e:
+                print(f"[Overlay] Empathetic TTS/listening error: {e}")
+                self._set_engine_status("Idle", Palette.SUCCESS)
+
+    def _process_empathetic_response(self, user_input):
+        """
+        Process the user's response to an empathetic proactive question.
+        This avoids reopening the microphone before the empathetic speech finishes.
+        """
+        self._set_transcript(user_input)
+        self._log(f"💬 Empathetic response: \"{user_input}\"")
+
+        # Reuse the existing normal processing pipeline.
+        self._last_empathetic_question = getattr(
+            self, "_last_empathetic_question", ""
+        )
+
+        # The existing run_cycle() expects to listen first, so don't call it here.
+        # Instead, this method should be wired to your existing screen/LLM processing
+        # function if you want the answer to immediately continue into Gemini.
 
     def _run_proactive_check(self, reason: str):
         """Called by ProactiveMonitor when the user appears stuck."""
@@ -796,7 +939,9 @@ class OverlayApp:
             self._set_engine_status("Analysing with AI…", Palette.WARNING)
             self._log("🧠 Sending to Gemini Vision…")
 
-            response = analyze_screen_and_intent(img, user_input, state_copy)
+            prior_q = getattr(self, "_last_empathetic_question", "")
+            response = analyze_screen_and_intent(img, user_input, state_copy, prior_context=prior_q)
+            self._last_empathetic_question = ""
 
             if not response:
                 self._cycle_had_error = True

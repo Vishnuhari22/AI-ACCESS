@@ -5,6 +5,8 @@ This is the core data contract between perception and intelligence.
 """
 import time
 from typing import List, Optional
+from modeling.user_state import UserStateVector
+from modeling.accessibility_policy import AccessibilityPolicy
 
 
 class ContextBundleAssembler:
@@ -12,17 +14,21 @@ class ContextBundleAssembler:
     @staticmethod
     def assemble(
         user_transcript: str,
-        user_state_dict: dict,
+        user_state: UserStateVector,
         kiosk_state: dict,
         conversation_history: List[dict],
         session_metadata: Optional[dict] = None
     ) -> dict:
+
+        accessibility = AccessibilityPolicy.evaluate(user_state)
+
+        user_state_dict = user_state.to_dict()
         """
         Assemble a complete Context Bundle for the LLM.
         
         Args:
             user_transcript: What the user just said (ASR output)
-            user_state_dict: Current UserStateVector as dict
+            user_state: Current canonical UserStateVector
             kiosk_state: Current kiosk screen state
             conversation_history: Last N conversation turns
             session_metadata: Optional session info (duration, etc.)
@@ -39,25 +45,31 @@ class ContextBundleAssembler:
             },
             
             "user_state": {
-                "visual_capability": user_state_dict.get("visual_capability", 1.0),
-                "motor_capability": user_state_dict.get("motor_capability", 1.0),
-                "cognitive_load": user_state_dict.get("cognitive_load", 0.0),
-                "frustration_level": user_state_dict.get("frustration_level", 0.0),
-                "interaction_speed": user_state_dict.get("interaction_speed", "normal"),
-                "age_group": user_state_dict.get("age_group", "adult"),
-                "hand_tremor": user_state_dict.get("hand_tremor", 0.0),
-                "wheelchair_detected": user_state_dict.get("wheelchair_detected", False),
-                "bystander_present": user_state_dict.get("bystander_present", False),
-                "estimated_age": user_state_dict.get("estimated_age", "adult"),
-                "behavioral_flags": user_state_dict.get("behavioral_flags", []),
-                "error_count": user_state_dict.get("error_count", 0),
-                "needs_accessibility_boost": (
-                    user_state_dict.get("visual_capability", 1.0) < 0.5
-                    or user_state_dict.get("motor_capability", 1.0) < 0.5
-                    or user_state_dict.get("cognitive_load", 0.0) > 0.6
-                    or user_state_dict.get("frustration_level", 0.0) > 0.5
-                    or user_state_dict.get("age_group", "adult") == "elderly"
-                )
+                "visual_capability": user_state.visual_capability,
+                "motor_capability": user_state.motor_capability,
+                "cognitive_load": user_state.cognitive_load,
+                "frustration_level": user_state.frustration_level,
+
+                "interaction_speed": user_state.interaction_speed,
+                "preferred_language": user_state.preferred_language,
+                "age_group": user_state.age_group,
+
+                "hand_tremor": user_state.hand_tremor,
+                "looking_down": user_state.looking_down,
+                "gaze_direction": user_state.gaze_direction,
+
+                "wheelchair_detected": user_state.wheelchair_detected,
+                "bystander_present": user_state.bystander_present,
+                "estimated_age": user_state.estimated_age,
+
+                "behavioral_flags": user_state.behavioral_flags,
+
+                "error_count": user_state.error_count,
+                "interaction_count": user_state.interaction_count,
+                "avg_response_time_ms": user_state.avg_response_time_ms,
+
+                # Deterministic decision made outside the LLM.
+                "accessibility_decision": accessibility,
             },
             
             "kiosk_state": kiosk_state,
@@ -65,7 +77,7 @@ class ContextBundleAssembler:
             "conversation_history": conversation_history[-10:],  # Last 10 turns max
             
             "session": session_metadata or {
-                "interaction_count": user_state_dict.get("interaction_count", 0),
+                "interaction_count": user_state.interaction_count,
                 "session_active": True
             }
         }
