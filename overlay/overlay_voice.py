@@ -1,6 +1,7 @@
 import pyttsx3
 import speech_recognition as sr
 import threading
+import time
 
 
 class OverlayVoice:
@@ -10,23 +11,9 @@ class OverlayVoice:
         self._is_speaking = False
         self._speak_lock = threading.Lock()
 
-    def speak(self, text: str, sensitive: bool = False) -> bool:
-        """Speaks the text aloud on a background thread.
-
-        Args:
-            text: The text to speak.
-            sensitive: If True, checks for headphones first. When no
-                       private audio output is detected the call is
-                       suppressed and the method returns False so the
-                       caller can display the text on-screen instead.
-
-        Returns:
-            True if TTS will play, False if suppressed for privacy.
-
-        pyttsx3 on Windows is NOT safe to call from arbitrary threads if a
-        persistent engine object is shared.  Re-initialising the engine inside
-        the TTS thread is the most reliable workaround on Windows.
-        """
+    def speak(self, text: str, rate: int = 175, sensitive: bool = False, block: bool = False) -> bool:
+        """Speaks the given text using local TTS (pyttsx3). Returns False if blocked by privacy rules.
+           If block is True, this method blocks until speech finishes."""
         if not text:
             return True
 
@@ -42,16 +29,25 @@ class OverlayVoice:
                 print("[Voice] audio_privacy unavailable — suppressing sensitive TTS.")
                 return False
 
-        with self._speak_lock:
-            if self._is_speaking:
-                print("[Voice] Already speaking — skipping overlapping TTS call.")
-                return True
-            self._is_speaking = True
+        # Wait if another TTS is playing and this is a blocking call
+        if block:
+            while True:
+                with self._speak_lock:
+                    if not self._is_speaking:
+                        self._is_speaking = True
+                        break
+                time.sleep(0.1)
+        else:
+            with self._speak_lock:
+                if self._is_speaking:
+                    print("[Voice] Already speaking — skipping overlapping TTS call.")
+                    return True
+                self._is_speaking = True
 
         def run_tts():
             try:
                 engine = pyttsx3.init()
-                engine.setProperty('rate', 160)   # slower for accessibility
+                engine.setProperty('rate', rate)   # configurable rate
                 engine.say(text)
                 engine.runAndWait()
                 engine.stop()
@@ -61,10 +57,15 @@ class OverlayVoice:
                 with self._speak_lock:
                     self._is_speaking = False
 
-        threading.Thread(target=run_tts, daemon=True).start()
+        tts_thread = threading.Thread(target=run_tts, daemon=True)
+        tts_thread.start()
+        
+        if block:
+            tts_thread.join()
+            
         return True
 
-    def listen_sync(self, timeout: int = 7) -> tuple[str, str]:
+    def listen_sync(self, timeout: int = 7, language: str = "en-IN") -> tuple[str, str]:
         """Blocks until speech is heard (or timeout) and returns (transcript, error_msg).
 
         Returns:
@@ -74,19 +75,20 @@ class OverlayVoice:
 
         Args:
             timeout: seconds to wait for speech to *start*
+            language: language code for speech recognition (e.g. 'en-IN', 'hi-IN', 'ta-IN')
         """
         try:
             with sr.Microphone() as source:
                 print("[Voice] Adjusting for ambient noise...")
                 self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
-                print("[Voice] Listening...")
+                print(f"[Voice] Listening ({language})...")
                 audio = self.recognizer.listen(
                     source,
                     timeout=timeout,
                     phrase_time_limit=10    # never hang longer than 10 s
                 )
-                print("[Voice] Recognizing via Google Speech...")
-                text = self.recognizer.recognize_google(audio)
+                print(f"[Voice] Recognizing via Google Speech ({language})...")
+                text = self.recognizer.recognize_google(audio, language=language)
                 print(f"[Voice] Transcribed: '{text}'")
                 return (text, "")
         except sr.WaitTimeoutError:
@@ -105,7 +107,44 @@ class OverlayVoice:
             print(f"[Voice] Unexpected ASR error: {e}")
             return ("", f"Voice error: {e}")
 
+    def listen_continuous(self, wake_word: str, callback, language: str = "en-IN"):
+        """
+        Listens continuously in the background for a wake word.
+        When wake word is heard, it calls the callback function with the full text.
+        
+        Returns a stop function to stop listening.
+        """
+        import re
+        wake_pattern = re.compile(r'\b' + re.escape(wake_word.lower()) + r'\b', re.IGNORECASE)
+        
+        def _callback(recognizer, audio):
+            if self._is_speaking:
+                return # Don't listen to our own voice
+            try:
+                text = recognizer.recognize_google(audio, language=language)
+                if text:
+                    print(f"[Voice|Continuous] Heard ({language}): '{text}'")
+                    if wake_pattern.search(text):
+                        print(f"[Voice|Continuous] Wake word '{wake_word}' detected!")
+                        # Remove wake word from text
+                        clean_text = wake_pattern.sub('', text).strip()
+                        # Invoke callback with the remainder
+                        callback(clean_text)
+            except sr.UnknownValueError:
+                pass
+            except sr.RequestError:
+                pass
+            except Exception as e:
+                print(f"[Voice|Continuous] Error: {e}")
 
+        source = sr.Microphone()
+        print("[Voice|Continuous] Calibrating microphone for background listening...")
+        with source as s:
+            self.recognizer.adjust_for_ambient_noise(s, duration=1.0)
+            
+        print(f"[Voice|Continuous] Starting background listener (Wake word: '{wake_word}', Language: {language})...")
+        stop_listening = self.recognizer.listen_in_background(source, _callback, phrase_time_limit=5)
+        return stop_listening
 if __name__ == "__main__":
     voice = OverlayVoice()
     voice.speak("System ready. Please say something.")

@@ -6,14 +6,10 @@ import pyautogui
 pyautogui.FAILSAFE = True
 
 
-def inject_click(normalized_x: float, normalized_y: float, monitor_info: dict):
+def inject_click(normalized_x: float, normalized_y: float, monitor_info: dict, overlay_window=None):
     """
     Uses pyautogui to inject a real OS-level mouse click, bypassing kiosk APIs.
-
-    Args:
-        normalized_x   : 0.0 – 1.0 fraction of monitor width  (from box_2d centre)
-        normalized_y   : 0.0 – 1.0 fraction of monitor height (from box_2d centre)
-        monitor_info   : dict from mss, e.g. {'left': 0, 'top': 0, 'width': 1920, 'height': 1080}
+    Checks if click would hit the overlay window and momentarily hides it if occluded.
     """
     screen_width  = monitor_info['width']
     screen_height = monitor_info['height']
@@ -26,6 +22,24 @@ def inject_click(normalized_x: float, normalized_y: float, monitor_info: dict):
     print(f"[Adapter] Injecting click -> screen coords ({target_x}, {target_y})  "
           f"[norm: ({normalized_x:.3f}, {normalized_y:.3f})]")
 
+    # Check for occlusion with overlay window
+    was_hidden = False
+    if overlay_window:
+        try:
+            if hasattr(overlay_window, 'winfo_rootx'):
+                wx = overlay_window.winfo_rootx()
+                wy = overlay_window.winfo_rooty()
+                ww = overlay_window.winfo_width()
+                wh = overlay_window.winfo_height()
+                if (wx <= target_x <= wx + ww) and (wy <= target_y <= wy + wh):
+                    print(f"[Adapter] ⚠️ Target ({target_x}, {target_y}) is under overlay! Briefly withdrawing...")
+                    overlay_window.withdraw()
+                    overlay_window.update()
+                    was_hidden = True
+                    time.sleep(0.15)
+        except Exception as e:
+            print(f"[Adapter] Notice checking overlay bounds: {e}")
+
     # Animate movement for visual clarity during demo (0.15 s is quick but visible)
     pyautogui.moveTo(target_x, target_y, duration=0.15)
 
@@ -34,6 +48,15 @@ def inject_click(normalized_x: float, normalized_y: float, monitor_info: dict):
     pyautogui.mouseDown()
     time.sleep(0.05)
     pyautogui.mouseUp()
+    
+    if was_hidden and overlay_window:
+        try:
+            print("[Adapter] Restoring overlay...")
+            overlay_window.deiconify()
+            overlay_window.update()
+            time.sleep(0.08)
+        except Exception:
+            pass
 
 
 def inject_text(text: str):
@@ -135,4 +158,20 @@ def inject_keys(keys: list):
             pyautogui.press(mapped)
             time.sleep(0.08)  # small gap between keypresses
         else:
-            print(f"[Adapter]   Unknown key: '{key}' — skipping")
+            print(f"[Adapter]   Unknown key ignored: '{key}'")
+
+
+def inject_scroll(direction: str):
+    """
+    Injects a mouse scroll event.
+    
+    Args:
+        direction: "down" or "up"
+    """
+    if direction == "down":
+        print("[Adapter] Scrolling DOWN")
+        pyautogui.scroll(-500)
+    elif direction == "up":
+        print("[Adapter] Scrolling UP")
+        pyautogui.scroll(500)
+    time.sleep(0.5)

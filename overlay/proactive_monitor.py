@@ -20,7 +20,7 @@ class ProactiveMonitor:
                  cooldown: float = 60.0):
         """
         Args:
-            get_state_fn: Callable returning vision state dict.
+            get_state_fn: Callable returning vision state dict (must include 'is_processing').
             trigger_fn:   Callable invoked with (reason: str) when help is warranted.
             inactivity_threshold: Seconds of inactivity before triggering.
             frustration_threshold: Seconds of sustained frustration before triggering.
@@ -28,9 +28,14 @@ class ProactiveMonitor:
         """
         self._get_state = get_state_fn
         self._trigger = trigger_fn
-        self._inactivity_threshold = inactivity_threshold
         self._frustration_threshold = frustration_threshold
         self._cooldown = cooldown
+
+        self._base_threshold = inactivity_threshold       # e.g. 30s (cold start)
+        self._engaged_threshold = 90.0                    # After first interaction
+        self._current_threshold = self._base_threshold
+        self._has_user_interacted = False
+        self._trigger_count_since_interaction = 0
 
         self._running = False
         self._thread = None
@@ -55,6 +60,9 @@ class ProactiveMonitor:
     def record_cycle(self):
         """Call whenever a voice cycle completes (resets inactivity timer)."""
         self._last_cycle_time = time.time()
+        self._has_user_interacted = True
+        self._current_threshold = self._engaged_threshold
+        self._trigger_count_since_interaction = 0
 
     # ── Internal ────────────────────────────────────────────────────────
 
@@ -63,7 +71,11 @@ class ProactiveMonitor:
 
     def _do_trigger(self, reason: str):
         self._last_trigger_time = time.time()
-        print(f"[ProactiveMonitor] Triggering: {reason}")
+        self._trigger_count_since_interaction += 1
+        # Double threshold after each trigger, cap at 300s
+        self._current_threshold = min(self._current_threshold * 2, 300.0)
+        
+        print(f"[ProactiveMonitor] Triggering: {reason} (Next threshold: {self._current_threshold}s)")
         try:
             self._trigger(reason)
         except Exception as e:
@@ -79,6 +91,11 @@ class ProactiveMonitor:
                     self._frustration_start = 0.0
                     time.sleep(3)
                     continue
+                    
+                if state.get("is_processing", False):
+                    self._frustration_start = 0.0
+                    time.sleep(3)
+                    continue
 
                 if not self._can_trigger():
                     time.sleep(3)
@@ -86,7 +103,7 @@ class ProactiveMonitor:
 
                 # Check 1: Inactivity
                 inactivity = now - self._last_cycle_time
-                if inactivity > self._inactivity_threshold:
+                if inactivity > self._current_threshold:
                     self._do_trigger(
                         f"User inactive for {inactivity:.0f}s with face present")
                     time.sleep(3)

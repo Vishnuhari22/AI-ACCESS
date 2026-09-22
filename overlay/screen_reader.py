@@ -10,17 +10,38 @@ from google import genai
 from google.genai import types
 from dotenv import load_dotenv
 
-# Load API keys from backend's .env file
-env_path = os.path.join(os.path.dirname(__file__), "..", "backend", ".env")
-load_dotenv(env_path)
+# Multi-path .env loader: checks overlay/.env, backend/.env, and project root
+_ENV_PATHS = [
+    os.path.join(os.path.dirname(__file__), ".env"),
+    os.path.join(os.path.dirname(__file__), "..", "backend", ".env"),
+    os.path.join(os.path.dirname(__file__), "..", ".env"),
+]
+for p in _ENV_PATHS:
+    if os.path.exists(p):
+        load_dotenv(p, override=False)
 
 # --- Gemini client ---
-api_key = os.getenv("GEMINI_API_KEY")
-if api_key:
-    _client = genai.Client(api_key=api_key)
-else:
-    print("WARNING: GEMINI_API_KEY not found in backend/.env")
-    _client = None
+_client = None
+def get_gemini_client():
+    global _client
+    if _client is not None:
+        return _client
+    for p in _ENV_PATHS:
+        if os.path.exists(p):
+            load_dotenv(p, override=False)
+    api_key = os.getenv("GEMINI_API_KEY")
+    if api_key and api_key != "your_gemini_api_key_here":
+        try:
+            _client = genai.Client(api_key=api_key)
+            print("[ScreenReader] Gemini client initialized successfully.")
+            return _client
+        except Exception as e:
+            print(f"[ScreenReader] Error initializing Gemini client: {e}")
+            return None
+    return None
+
+_client = get_gemini_client()
+
 
 # --- OpenAI client (fallback) ---
 _openai_client = None
@@ -60,6 +81,18 @@ JSON Schema:
     "screen_description": "Short plain-English summary of what is on screen",
     "speech_response": "What the TTS engine should read aloud to the user",
     "is_sensitive": false,
+    "captcha_detected": false,
+    "pending_fields": ["Description of unfilled required fields, or empty array"],
+    "visible_results": [
+        {
+            "label": "Short human-readable label (e.g., 'Kerala Express - Dep 15:30 - 3A Available')",
+            "name": "Target name for clicking (e.g., 'Book Now for Kerala Express')",
+            "box_2d": [ymin, xmin, ymax, xmax]
+        }
+    ],
+    "has_more_results": false,
+    "page_guidance": "Brief orientation for the user after a page change, or null",
+    "expects_response": false,
     "targets": [
         {
             "name": "Label of the button, link, or input field",
@@ -70,10 +103,12 @@ JSON Schema:
     "selected_targets": [
         {
             "name": "The target(s) matched to the user's request",
-            "box_2d": [ymin, xmin, ymax, xmax],
+            "box_2d": "[ymin, xmin, ymax, xmax] or null if purely scrolling/keyboard",
             "type_text": "Text to type into the field after clicking, or null",
             "press_keys": ["key1", "key2"],
-            "follow_up": "Description of what to click next after this action opens a menu/dropdown, or null"
+            "follow_up": "Description of what to click next after this action opens a menu/dropdown, or null",
+            "scroll_direction": "Set to 'down' or 'up' ONLY if you need to scroll the page BEFORE finding the target, otherwise null",
+            "requires_confirmation": false
         }
     ]
 }
@@ -81,7 +116,17 @@ JSON Schema:
 Rules:
 - box_2d values are integers 0-1000 representing [ymin, xmin, ymax, xmax] on a 1000x1000 grid.
 - The grid maps to the FULL screenshot: (0,0) is top-left of the monitor, (1000,1000) is bottom-right.
+- If you need to scroll to find something not visible, return a dummy box_2d like [500,500,500,500] and set scroll_direction to 'down' or 'up'.
 - is_sensitive: set to true when the speech_response contains private data such as PINs, passwords, account numbers, balances, or OTPs. Otherwise false.
+- captcha_detected: set to true if there is a CAPTCHA challenge visible. Set speech_response to instruct the user to complete it manually and say 'done'.
+- requires_confirmation: set to true for high-risk actions (e.g., Pay, Submit, Confirm, Transfer, Delete, Book Ticket). The overlay will ask the user for confirmation before clicking.
+
+CONVERSATIONAL RULES:
+- If you ask the user a question in your speech_response (e.g. "Which time do you prefer?", "Would you like to book this?"), you MUST set "expects_response" to true.
+- If you set "expects_response" to true, DO NOT execute any actions that depend on their answer. Set selected_targets to [] until they reply.
+
+SCROLLING & KEYBOARD ONLY:
+- If the user asks to "scroll down", "go back", or "press enter", and NO click is needed, you can return a target with "box_2d": null, and set "scroll_direction" (e.g. "down") or "press_keys" (e.g. ["escape"]). The system will execute the scroll/keys without clicking.
 - EVERY item in 'targets' MUST have its own box_2d. Do not omit any.
 - Make bounding boxes TIGHT around the clickable element — do not use overly large boxes.
 - Leave 'selected_targets' as an empty array [] when the user is only asking what is available (not requesting an action).
@@ -91,6 +136,7 @@ Rules:
 TEXT INPUT RULES:
 - When the user's voice input implies typing into a field (e.g. "from Chengannur", "enter 5000", "search for trains"), set "type_text" to ONLY the value to type (e.g. "Chengannur", "5000", "trains").
 - The system will automatically clear any existing text in the field before typing.
+- MULTIPLE ACTIONS: If the user request involves filling multiple fields (e.g. 'from X to Y'), you MUST return multiple objects in selected_targets (e.g. one for From, one for To). The system will execute them in order.
 - IMPORTANT: Identify the CORRECT target field from context. "from Chengannur" means the FROM/SOURCE field. "to Trivandrum" means the TO/DESTINATION field. Do NOT just type into whatever field is currently active — click the RIGHT field first.
 
 KEYBOARD ACTIONS (press_keys):
@@ -105,6 +151,27 @@ CRITICAL RULES FOR DROPDOWNS AND AUTOCOMPLETE:
 - Set follow_up to null when no second action is needed (most cases — buttons, links, etc.).
 - For DATE PICKERS: click the date input field. Use press_keys to navigate if needed.
 - NEVER guess how many arrow-down presses are needed for a dropdown — you cannot see the options.
+
+FORM COMPLETION CHECK:
+- Before including a Submit/Search/Find/Book button in selected_targets, CHECK if there are required form fields that appear empty or set to default values.
+- If you detect unfilled required fields (e.g., date field showing today's date on a travel booking form), DO NOT include the submit button in selected_targets. Instead:
+  1. Set selected_targets to []
+  2. Set pending_fields to describe what's missing
+  3. Set speech_response to ask the user for the missing information
+- Only include Submit/Search when ALL visible required fields appear filled with user-intended values.
+
+RESULT LISTS:
+- When the screen shows a list of results (trains, flights, products), populate "visible_results" with each distinct result visible. Include a human-readable label (train name + time + availability).
+- Set "has_more_results" to true if there appears to be a scroll area indicating more results below.
+- If availability is not loaded (shows "Refresh"), mention this in the label.
+- Set visible_results to [] when not showing a results list.
+
+PAGE GUIDANCE:
+- When the user's action will cause a page navigation or major UI change (clicking Search, Submit, Next), set page_guidance to a brief 1-2 sentence orientation describing:
+  1. What the new page/section shows
+  2. Any non-obvious required actions (e.g., "Seat availability needs to be refreshed")
+  3. A suggested next step
+- Set page_guidance to null for simple in-page actions.
 """
 
 # Gemini models to try in order (flash/lite only — Pro is no longer free tier)
@@ -167,6 +234,49 @@ def capture_screen(hide_window=None):
                 _show_event.wait(timeout=0.5)   # wait for restore before continuing
             except Exception:
                 pass
+
+
+def wait_for_stable_screen(timeout: float = 4.0, interval: float = 0.3, threshold: float = 0.04) -> bool:
+    """
+    Waits until the target screen stops changing (e.g., page load finishes).
+    Runs passively without hiding or blinking the overlay window.
+    
+    Args:
+        timeout: Maximum time to wait in seconds (default 4s).
+        interval: Time between comparison snapshots (default 0.3s).
+        threshold: Fraction of pixels that must change to be considered 'unstable'.
+        
+    Returns:
+        True if screen stabilized, False if timed out.
+    """
+    from PIL import ImageChops
+
+    start_time = time.time()
+    # Grab baseline without hiding overlay (avoids UI blinking)
+    img1, _ = capture_screen(hide_window=None)
+    
+    while time.time() - start_time < timeout:
+        time.sleep(interval)
+        img2, _ = capture_screen(hide_window=None)
+        
+        diff = ImageChops.difference(img1, img2)
+        bbox = diff.getbbox()
+        if not bbox:
+            return True
+        
+        # Downsample to 100x100 for fast difference metric
+        diff_small = diff.resize((100, 100))
+        diff_pixels = list(diff_small.getdata())
+        changed_pixels = sum(1 for p in diff_pixels if any(c > 15 for c in p))
+        diff_ratio = changed_pixels / 10000.0
+        
+        if diff_ratio < threshold:
+            return True
+            
+        img1 = img2
+        
+    return False
+
 
 
 def _strip_markdown_fences(text: str) -> str:
@@ -236,9 +346,11 @@ def _normalise_response(parsed: dict) -> dict:
 
 def analyze_screen_and_intent(screenshot: Image.Image,
                                user_voice_text: str,
-                               user_state: dict) -> dict | None:
+                               user_state: dict,
+                               conversation_context: list = None) -> dict | None:
     """Sends screenshot + voice text to Gemini Vision and returns parsed JSON."""
-    if _client is None:
+    client = get_gemini_client()
+    if client is None:
         print("[ScreenReader] No Gemini client — API key missing.")
         return None
 
@@ -247,10 +359,15 @@ def analyze_screen_and_intent(screenshot: Image.Image,
     screenshot.save(buf, format="PNG")
     image_bytes = buf.getvalue()
 
+    context_str = ""
+    if conversation_context:
+        context_str = "Recent Interaction History:\n" + "\n".join(f"- {c}" for c in conversation_context)
+
     contents = [
         SYSTEM_PROMPT,
         types.Part.from_bytes(data=image_bytes, mime_type="image/png"),
         f"User State Context: {json.dumps(user_state)}",
+        context_str,
         f"User Voice Request: '{user_voice_text}'",
     ]
 
@@ -454,6 +571,76 @@ Place coordinates precisely on the CENTER of the target option text.
 
         except Exception as e:
             print(f"[ScreenReader] Follow-up error: {e}")
+            return None
+
+    return None
+
+
+def analyze_dropdown_options(screenshot: Image.Image,
+                             follow_up_instruction: str,
+                             user_original_text: str) -> dict | None:
+    """Calls Gemini to extract ALL visible dropdown options.
+    
+    Used for ambiguous dropdowns (like autocomplete station names).
+    Returns a dict with 'options' (list) and 'best_match' (dict or null),
+    or None on failure.
+    """
+    if _client is None:
+        return None
+
+    buf = io.BytesIO()
+    screenshot.save(buf, format="PNG")
+    image_bytes = buf.getvalue()
+
+    prompt = f"""You are looking at a screenshot of a desktop. An autocomplete dropdown menu or popup is now open on screen.
+
+User's original intent: '{user_original_text}'
+Follow-up instruction: '{follow_up_instruction}'
+
+Find ALL visible options in the dropdown/menu.
+If one of the options clearly matches the user's original intent better than the others (e.g. they said 'Ernakulam Junction' and an option says 'ERNAKULAM JN - ERS'), set it as best_match. If it's ambiguous (they said 'Ernakulam' and both 'Town' and 'Junction' exist), set best_match to null.
+
+Return ONLY a JSON object:
+{{
+    "options": [
+        "exact text of option 1",
+        "exact text of option 2"
+    ],
+    "best_match": "exact text of the matched option" // or null if ambiguous or no clear match
+}}
+"""
+
+    contents = [
+        prompt,
+        types.Part.from_bytes(data=image_bytes, mime_type="image/png"),
+    ]
+
+    for model_name in _MODEL_PRIORITY[:1]:
+        try:
+            start_t = time.time()
+            print(f"[ScreenReader] Dropdown analyze call to {model_name}...")
+
+            response = _client.models.generate_content(
+                model=model_name,
+                contents=contents,
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.1,
+                    max_output_tokens=1024,
+                ),
+            )
+
+            elapsed = time.time() - start_t
+            text = response.text.strip()
+            text = _strip_markdown_fences(text)
+            print(f"[ScreenReader] Dropdown analyze responded in {elapsed:.1f}s")
+
+            parsed = json.loads(text)
+            if parsed.get("options"):
+                return parsed
+            return None
+        except Exception as e:
+            print(f"[ScreenReader] Dropdown analyze error: {e}")
             return None
 
     return None

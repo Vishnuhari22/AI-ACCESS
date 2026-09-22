@@ -1,4 +1,11 @@
 import ctypes
+import sys
+import os
+
+_OVERLAY_DIR = os.path.dirname(os.path.abspath(__file__))
+if _OVERLAY_DIR not in sys.path:
+    sys.path.insert(0, _OVERLAY_DIR)
+
 # Crucial fix for Windows 10/11 Scaling: Prevents pyautogui from missing targets on zoomed screens
 try:
     ctypes.windll.shcore.SetProcessDpiAwareness(2)
@@ -13,12 +20,14 @@ from tkinter import font as tkfont
 import threading
 import time
 from datetime import datetime
+import winsound
 
 from screen_reader import (capture_screen, analyze_screen_and_intent,
-                          analyze_follow_up, verify_anchor, analyze_proactive)
+                          analyze_follow_up, verify_anchor, analyze_proactive, analyze_dropdown_options,
+                          wait_for_stable_screen, get_gemini_client)
 from overlay_voice import OverlayVoice
 from overlay_vision import OverlayVision
-from overlay_adapter import inject_click, inject_text, inject_keys
+from overlay_adapter import inject_click, inject_text, inject_keys, inject_scroll
 from proactive_monitor import ProactiveMonitor
 from escalation import EscalationManager, EscalationState
 
@@ -112,9 +121,18 @@ class OverlayApp:
         )
 
         # Hysteresis: require N consecutive readings before switching adaptation
-        self._HYSTERESIS_THRESHOLD = 6  # 6 × 0.5s = 3 seconds of stable signal
+        self._HYSTERESIS_THRESHOLD = 3  # 3 × 0.5s = 1.5 seconds of stable signal
         self._pending_level = AdaptationLevel.NORMAL
         self._pending_count = 0
+
+        # Adaptation state
+        self._last_visual_time = 0.0
+        self._last_motor_time = 0.0
+        self._last_face_time = time.time()
+        self._dock_left = False
+        self._is_seated = False
+        self._conversation_context = []
+
 
         # --- Fonts (will be reconfigured on adaptation) ---
         self._base_fonts = {
@@ -140,15 +158,17 @@ class OverlayApp:
         self.header_frame = tk.Frame(root, bg=Palette.BG)
         self.header_frame.pack(fill=tk.X, padx=12, pady=(10, 2))
         self.title_lbl = tk.Label(
-            self.header_frame, text="⬟  UIAA Overlay Active",
+            self.header_frame, text="⬟  UIAA Overlay",
             font=self._fonts["title"], fg=Palette.ACCENT, bg=Palette.BG, anchor="w"
         )
         self.title_lbl.pack(side=tk.LEFT)
-        self.version_lbl = tk.Label(
-            self.header_frame, text="v2.0",
-            font=self._fonts["indicator"], fg=Palette.TEXT_DIM, bg=Palette.BG, anchor="e"
+        
+        self.dock_btn = tk.Button(
+            self.header_frame, text="⇄ Dock", font=self._fonts["indicator"],
+            bg=Palette.KEYPAD_BTN, fg=Palette.TEXT_DIM, relief=tk.FLAT,
+            command=self._toggle_dock, padx=4, pady=2, cursor="hand2"
         )
-        self.version_lbl.pack(side=tk.RIGHT)
+        self.dock_btn.pack(side=tk.RIGHT, padx=4)
 
         # Thin accent line under header
         tk.Frame(root, bg=Palette.ACCENT, height=2).pack(fill=tk.X, padx=12, pady=(2, 6))
@@ -199,6 +219,26 @@ class OverlayApp:
             font=self._fonts["indicator"], fg=Palette.TEXT_DIM, bg=Palette.BG, anchor="w"
         )
         self.adapt_lbl.pack(side=tk.LEFT)
+
+        # Wake word toggle
+        self._wake_word_enabled = tk.BooleanVar(value=False)
+        self.wake_cb = tk.Checkbutton(
+            root, text="Wake Word ('access')", variable=self._wake_word_enabled,
+            font=self._fonts["indicator"], bg=Palette.BG, fg=Palette.TEXT_DIM,
+            selectcolor=Palette.BG, activebackground=Palette.BG,
+            command=self._toggle_wake_word
+        )
+        self.wake_cb.pack(fill=tk.X, padx=12, pady=(0, 0))
+        self._wake_stop_fn = None
+        
+        # Guide Mode toggle
+        self._guide_mode_enabled = tk.BooleanVar(value=False)
+        self.guide_cb = tk.Checkbutton(
+            root, text="Guide Mode (Narrate pages)", variable=self._guide_mode_enabled,
+            font=self._fonts["indicator"], bg=Palette.BG, fg=Palette.TEXT_DIM,
+            selectcolor=Palette.BG, activebackground=Palette.BG
+        )
+        self.guide_cb.pack(fill=tk.X, padx=12, pady=(0, 4))
 
         # ④ Voice Cycle Button
         self.btn_listen = tk.Button(
@@ -378,6 +418,31 @@ class OverlayApp:
         else:
             return AdaptationLevel.NORMAL
 
+    def _toggle_dock(self):
+        self._dock_left = not self._dock_left
+        self._update_window_geometry()
+
+    def _update_window_geometry(self):
+        scale = self._FONT_SCALE[self._adaptation_level]
+        new_w = int(self._base_width * scale)
+        new_h = int(self._base_height * scale)
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        
+        # X Position: dock left vs right
+        if self._dock_left:
+            x_pos = 16
+        else:
+            x_pos = max(0, screen_w - new_w - 16)
+            
+        # Y Position: seated (wheelchair reachability) vs standing
+        if self._is_seated:
+            y_pos = max(30, screen_h - new_h - 40)
+        else:
+            y_pos = 30
+            
+        self.root.geometry(f"{new_w}x{new_h}+{x_pos}+{y_pos}")
+
     def _apply_adaptation(self, level: str):
         """Apply full UI adaptation based on the detected level.
 
@@ -393,17 +458,13 @@ class OverlayApp:
         print(f"[Overlay] Adaptation: {old_level} -> {level} (scale {scale}x)")
 
         # --- 0. Dynamic window resize (fluid container) --- 
-        new_w = int(self._base_width * scale)
-        new_h = int(self._base_height * scale)
-        screen_w = self.root.winfo_screenwidth()
-        x_pos = max(0, screen_w - new_w - 16)
-        self.root.geometry(f"{new_w}x{new_h}+{x_pos}+30")
+        self._update_window_geometry()
 
         # --- 1. Rescale all fonts ---
         self._rescale_fonts(scale)
 
         if level in (AdaptationLevel.VISUAL, AdaptationLevel.FULL):
-            # --- HIGH CONTRAST MODE ---
+            # --- HIGH CONTRAST MODE (Yellow on Black) ---
             bg      = Palette.HC_BG
             bg_card = Palette.HC_BTN
             text    = Palette.HC_TEXT
@@ -451,7 +512,8 @@ class OverlayApp:
 
         # --- 3. Recolour labels ---
         self.title_lbl.config(fg=accent, bg=bg)
-        self.version_lbl.config(fg=dim, bg=bg)
+        if hasattr(self, 'dock_btn'):
+            self.dock_btn.config(fg=text, bg=btn_bg)
         self.keypad_title.config(fg=dim, bg=bg)
         self.adapt_lbl.config(bg=bg)
 
@@ -510,39 +572,156 @@ class OverlayApp:
             state = self.vision.get_latest_state()
 
             if state["face_detected"]:
-                sq_text = "Squinting ⚠️" if state["squinting"] else "Normal"
-                ln_text = "Leaning ↗️" if state["leaning_forward"] else "Normal"
-                ld_text = " | 👇 Down" if state.get("looking_down") else ""
-                # Show eye calibration status
-                if self.vision._baseline_eye_gap > 0.001:
-                    eye_info = f" | 👁 {self.vision._baseline_eye_gap:.3f}"
+                self._last_face_time = time.time()
+                if state.get("is_calibrating"):
+                    status = "Calibrating..."
+                    dot_color = Palette.WARNING
+                    self.root.after(0, self._set_description, "Calibrating camera... Please look straight at the screen.")
                 else:
-                    eye_info = " | 👁 cal…"
-                status = f"👁 {sq_text} | {ln_text}{ld_text}{eye_info}"
-                dot_color = Palette.WARNING if (state["squinting"] or state["leaning_forward"]) else Palette.SUCCESS
+                    if state.get("standing_above_frame"):
+                        stance_text = "🧍 Standing (Head Above Frame)"
+                    elif state.get("seated"):
+                        stance_text = "🪑 Sitting"
+                    else:
+                        stance_text = "🧍 Standing"
+                    
+                    if state.get("looking_down"):
+                        pitch_text = "👇 Down"
+                    elif state.get("looking_up"):
+                        pitch_text = "👆 Up"
+                    else:
+                        pitch_text = "Straight"
+
+                    sq_text = "Squinting ⚠️" if state.get("squinting") else "Eyes OK"
+                    ln_text = "Leaning ↗️" if state.get("leaning_forward") else "Upright"
+
+                    status = f"{stance_text} | {pitch_text} | {sq_text} | {ln_text}"
+                    dot_color = Palette.WARNING if (state.get("squinting") or state.get("leaning_forward")) else Palette.SUCCESS
+                    
+                    # Clear calibration text if it was showing
+                    if self._desc_var.get().startswith("Calibrating"):
+                        self.root.after(0, self._set_description, "")
             else:
                 status = "No face detected"
                 dot_color = Palette.TEXT_DIM
+                
+                # Session Timer / Kiosk Auto-Reset
+                if time.time() - self._last_face_time > 60.0:
+                    self.root.after(0, self._reset_kiosk_session)
+                    self._last_face_time = time.time() # prevent repeated calls
+
+
+            # Handle seated transition for wheelchair ergonomics
+            was_seated = self._is_seated
+            self._is_seated = state.get("seated", False)
+            if was_seated != self._is_seated:
+                self.root.after(0, self._update_window_geometry)
 
             # Thread-safe Tkinter updates via root.after
             self.root.after(0, self._vision_status.set, status)
             if self._vision_dot:
                 self.root.after(0, self._vision_dot.config, {"fg": dot_color})
 
-            # Compute adaptation level with hysteresis to prevent flickering
-            new_level = self._compute_adaptation_level(state)
+            # Decoupled sticky timers: visual (20s hold) and motor (10s hold)
+            now = time.time()
+            is_calib = state.get("is_calibrating", False)
+            if is_calib:
+                # Do NOT trigger or accumulate adaptations while camera is calibrating
+                self._last_visual_time = 0.0
+                self._last_motor_time = 0.0
+                self._pending_level = AdaptationLevel.NORMAL
+                self._pending_count = 0
+                new_level = AdaptationLevel.NORMAL
+            else:
+                if state.get("squinting"):
+                    self._last_visual_time = now
+                if state.get("leaning_forward"):
+                    self._last_motor_time = now
+
+                visual_active = (now - self._last_visual_time < 20.0)
+                motor_active  = (now - self._last_motor_time < 10.0)
+
+                if visual_active and motor_active:
+                    new_level = AdaptationLevel.FULL
+                elif visual_active:
+                    new_level = AdaptationLevel.VISUAL
+                elif motor_active:
+                    new_level = AdaptationLevel.MOTOR
+                else:
+                    new_level = AdaptationLevel.NORMAL
+
             if new_level == self._pending_level:
                 self._pending_count += 1
             else:
                 self._pending_level = new_level
                 self._pending_count = 1
 
-            # Only apply if stable for enough consecutive readings AND different from current
-            if (self._pending_count >= self._HYSTERESIS_THRESHOLD and
+            # Require 2 consecutive frames (1.0s) to activate elevated mode (eliminates twitchy 1-frame triggers)
+            # Require 3 consecutive frames (1.5s) to decay back to NORMAL
+            req_count = 2 if self._pending_level != AdaptationLevel.NORMAL else self._HYSTERESIS_THRESHOLD
+            if (self._pending_count >= req_count and
                     self._pending_level != self._adaptation_level):
                 self.root.after(0, self._apply_adaptation, self._pending_level)
 
             time.sleep(0.5)
+
+    def _play_success_sound(self):
+        def _sound():
+            try:
+                winsound.Beep(880, 100)
+                time.sleep(0.05)
+                winsound.Beep(1046, 150)
+            except:
+                pass
+        threading.Thread(target=_sound, daemon=True).start()
+
+    def _play_error_sound(self):
+        def _sound():
+            try:
+                winsound.Beep(440, 250)
+                time.sleep(0.05)
+                winsound.Beep(330, 300)
+            except:
+                pass
+        threading.Thread(target=_sound, daemon=True).start()
+
+    def _reset_kiosk_session(self):
+        self._conversation_context.clear()
+        self._set_transcript("")
+        self._transcript_visible = False
+        self.transcript_frame.pack_forget()
+        self._set_description("Session reset due to inactivity. Welcome back.")
+        self._log("🔄 Kiosk auto-reset (60s inactivity).")
+        # Ensure adaptation resets
+        self._last_visual_time = 0.0
+        self._last_motor_time = 0.0
+        self._pending_level = AdaptationLevel.NORMAL
+        self._pending_count = 0
+        self._escalation.reset()
+        self._apply_adaptation(AdaptationLevel.NORMAL)
+
+    def _start_ai_pulse(self):
+        self._ai_pulsing = True
+        self._pulse_state = False
+        self._pulse_ai_dot()
+
+    def _stop_ai_pulse(self):
+        self._ai_pulsing = False
+        if self._engine_dot:
+            self.root.after(0, self._engine_dot.config, {"fg": Palette.SUCCESS})
+
+    def _pulse_ai_dot(self):
+        if not self._ai_pulsing or not self._engine_dot:
+            return
+        
+        self._pulse_state = not self._pulse_state
+        color = Palette.WARNING if self._pulse_state else Palette.TEXT_DIM
+        self._engine_dot.config(fg=color)
+        
+        dots = "." * (1 + (int(time.time() * 3) % 3))
+        self._engine_status.set(f"Analysing with AI{dots}")
+        
+        self.root.after(333, self._pulse_ai_dot)
 
     # ══════════════════════════════════════════════════════════════════════
     # Activity Log
@@ -707,9 +886,8 @@ class OverlayApp:
             btn_type = t.get("type", "button")
             icon = type_icons.get(btn_type, "🔘")
 
-            # Build display text: ① 🔘 Withdraw Cash
             circled_num = chr(0x245F + idx) if idx <= 20 else str(idx)
-            display_text = f" {circled_num}  {icon}  {btn_name}"
+            display_text = f"{circled_num} {icon}\n{btn_name}"
 
             def make_click_handler(target_info, mon):
                 def handler():
@@ -719,7 +897,7 @@ class OverlayApp:
                         nx = ((xmin + xmax) / 2) / 1000.0
                         ny = ((ymin + ymax) / 2) / 1000.0
                         self._log(f"Keypad click -> '{target_info.get('name')}' ({nx:.3f}, {ny:.3f})")
-                        inject_click(nx, ny, mon)
+                        inject_click(nx, ny, mon, self.root)
                     else:
                         self._log(f"❌ No coordinates for '{target_info.get('name')}'")
                 return handler
@@ -733,14 +911,23 @@ class OverlayApp:
                 activeforeground="white",
                 relief=tk.FLAT,
                 height=btn_height,
-                anchor="w",
-                padx=12,
+                anchor="center",
+                justify="center",
+                padx=8, pady=btn_pady,
                 cursor="hand2",
                 highlightbackground=btn_border,
                 highlightthickness=1,
                 command=make_click_handler(t, monitor_info)
             )
-            btn.pack(fill=tk.X, pady=btn_pady, padx=4)
+            
+            # Grid layout: 2 columns
+            row = (idx - 1) // 2
+            col = (idx - 1) % 2
+            btn.grid(row=row, column=col, sticky="nsew", padx=4, pady=4)
+
+        # Make columns equal width
+        self.keypad_frame.grid_columnconfigure(0, weight=1, uniform="col")
+        self.keypad_frame.grid_columnconfigure(1, weight=1, uniform="col")
 
         # Update keypad title with count
         self.keypad_title.config(text=f"▸ Virtual Accessibility Keypad  ({len(targets)} targets)")
@@ -748,32 +935,94 @@ class OverlayApp:
         # Reset scroll position
         self.keypad_canvas.yview_moveto(0)
 
+    def _toggle_wake_word(self):
+        if self._wake_word_enabled.get():
+            self._log("🎙️ Wake word enabled (Listening for 'access')")
+            self._wake_stop_fn = self.voice.listen_continuous("access", self._on_wake_word)
+        else:
+            if self._wake_stop_fn:
+                self._log("🎙️ Wake word disabled")
+                self._wake_stop_fn(wait_for_stop=False)
+                self._wake_stop_fn = None
+
+    def _on_wake_word(self, clean_text):
+        if self.btn_listen.cget("state") != tk.DISABLED:
+            self.run_cycle_async(pre_transcribed_text=clean_text)
+
+    def _listen_for_reply(self, timeout: int = 8) -> tuple[str, str]:
+        """Reliably listens for a user reply.
+        
+        Pauses wake word listener, waits for TTS to fully finish,
+        gives the audio hardware a moment to settle, then listens.
+        Returns a tuple of (transcript_string, error_message).
+        """
+        # 1. Pause wake word listener so it doesn't steal the mic
+        wake_was_enabled = self._wake_word_enabled.get()
+        if wake_was_enabled and self._wake_stop_fn:
+            self._log("⏸ Pausing wake word listener for reply...")
+            self._wake_stop_fn(wait_for_stop=False)
+            self._wake_stop_fn = None
+
+        try:
+            # 2. Busy-wait until TTS is truly done (belt + suspenders)
+            wait_start = time.time()
+            while self.voice._is_speaking and (time.time() - wait_start) < 10:
+                time.sleep(0.1)
+
+            # 3. Let audio hardware fully release (pyttsx3 SAPI5 holds output briefly)
+            time.sleep(0.5)
+
+            # 4. Listen
+            self._set_engine_status("🎙 Listening…", Palette.WARNING)
+            self._log("🎙 Mic ON — waiting for your reply...")
+            reply, err = self.voice.listen_sync(timeout=timeout)
+            if reply:
+                self._log(f"🎙 Heard: '{reply}'")
+            else:
+                self._log(f"🎙 No reply captured ({err})")
+            return reply, err
+
+        finally:
+            # 5. Restart wake word listener if it was on
+            if wake_was_enabled:
+                self._log("▶ Resuming wake word listener")
+                self._wake_stop_fn = self.voice.listen_continuous("access", self._on_wake_word)
+
     # ══════════════════════════════════════════════════════════════════════
     # Main Pipeline — runs on background thread
     # ══════════════════════════════════════════════════════════════════════
-    def run_cycle_async(self):
-        self.btn_listen.config(state=tk.DISABLED)
-        threading.Thread(target=self.run_cycle, daemon=True).start()
+    def run_cycle_async(self, pre_transcribed_text: str = None):
+        """Dispatches the vision/voice cycle to a background thread."""
+        self.root.after(0, self.btn_listen.config, {"state": tk.DISABLED})
+        threading.Thread(target=self.run_cycle, args=(pre_transcribed_text,), daemon=True).start()
 
-    def run_cycle(self):
+    def run_cycle(self, pre_transcribed_text: str = None):
         self._cycle_had_error = False
         self._last_cycle_time = time.time()
         if hasattr(self, '_proactive'):
             self._proactive.record_cycle()
         try:
-            # --- Step 1: Listen ---
-            self._set_voice_status("Listening…", Palette.WARNING)
-            self._set_engine_status("Waiting for voice…", Palette.WARNING)
-            self._log("🎤 Listening for voice input…")
+            # --- Step 1: Voice Input ---
+            self.root.after(0, self.btn_listen.config, {"state": tk.DISABLED})
+            
+            if pre_transcribed_text:
+                self._log(f"🎤 Wake word triggered! Pre-transcribed: {pre_transcribed_text}")
+                user_input = pre_transcribed_text
+                if not user_input.strip():
+                    user_input = "Please help me with this screen." # fallback if they just said "access"
+            else:
+                self._set_voice_status("Listening…", Palette.WARNING)
+                self._log("🎤 Listening for voice input…")
 
-            user_input, voice_error = self.voice.listen_sync(timeout=7)
+                user_input, voice_error = self._listen_for_reply(timeout=7)
 
-            if not user_input:
-                error_msg = voice_error or "No speech detected"
-                self._set_voice_status(f"⚠ {error_msg}", Palette.WARNING)
-                self._set_engine_status("Idle", Palette.SUCCESS)
-                self._log(f"⚠ {error_msg}")
-                return
+                if not user_input:
+                    error_msg = voice_error or "No speech detected"
+                    self._set_voice_status(f"⚠ {error_msg}", Palette.WARNING)
+                    self._set_engine_status("Idle", Palette.SUCCESS)
+                    self._log(f"⚠ {error_msg}")
+                    self._play_error_sound()
+                    return
 
             self._set_voice_status("Transcribed ✓", Palette.SUCCESS)
             self._set_transcript(user_input)
@@ -781,6 +1030,11 @@ class OverlayApp:
 
             # --- Step 2: Capture screen (overlay hides briefly for clean screenshot) ---
             self._set_engine_status("Capturing screen…", Palette.WARNING)
+            
+            # Wait passively for page animations to finish without blinking overlay
+            wait_for_stable_screen(timeout=2.5, interval=0.25)
+            
+            # Take clean screenshot with single brief overlay hide
             img, mon = capture_screen(hide_window=self.root)
             self.monitor_info = mon
             self._log(f"📷 Screen captured ({img.size[0]}×{img.size[1]})")
@@ -788,20 +1042,31 @@ class OverlayApp:
             # --- Step 3: Read vision state ---
             with self._lock:
                 state_copy = self.vision.user_state.copy() if self.vision else {}
+            st = "sitting" if state_copy.get("seated") else "standing"
+            pt = "down" if state_copy.get("looking_down") else ("up" if state_copy.get("looking_up") else "straight")
             sq = state_copy.get("squinting", False)
             ln = state_copy.get("leaning_forward", False)
-            self._log(f"👁 User state: squinting={sq}, leaning={ln}")
+            self._log(f"👁 User state: {st}, pitch={pt}, squinting={sq}, leaning={ln}")
 
             # --- Step 4: Call Gemini Vision ---
             self._set_engine_status("Analysing with AI…", Palette.WARNING)
+            self._start_ai_pulse()
             self._log("🧠 Sending to Gemini Vision…")
 
-            response = analyze_screen_and_intent(img, user_input, state_copy)
+            response = analyze_screen_and_intent(img, user_input, state_copy, self._conversation_context)
+            
+            self._stop_ai_pulse()
 
             if not response:
                 self._cycle_had_error = True
-                self._set_engine_status("❌ AI Error", Palette.ERROR)
-                self._log("❌ Gemini returned no valid response")
+                if get_gemini_client() is None:
+                    err_msg = "API Key Missing"
+                    detail = "Please set GEMINI_API_KEY in overlay/.env"
+                else:
+                    err_msg = "AI Error"
+                    detail = "Gemini returned no valid response"
+                self._set_engine_status(f"❌ {err_msg}", Palette.ERROR)
+                self._log(f"❌ {detail}")
                 return
 
             targets = response.get("targets") or []
@@ -811,120 +1076,250 @@ class OverlayApp:
             # --- Step 5: Speak response (with privacy gate) ---
             speech = response.get("speech_response", "")
             is_sensitive = response.get("is_sensitive", False)
+            expects_reply = response.get("expects_response", False)
             if speech:
-                spoken = self.voice.speak(speech, sensitive=is_sensitive)
+                spoken = self.voice.speak(speech, sensitive=is_sensitive, block=expects_reply)
                 if not spoken:
                     # Sensitive data suppressed — show on screen instead
                     self._show_sensitive_on_screen(speech)
                     self._log(f"🔒 Sensitive (screen only): \"{speech[:60]}\"")
                 else:
                     self._log(f"🔊 Speaking: \"{speech[:60]}{'…' if len(speech) > 60 else ''}\"")
-
             # --- Step 6: Update UI ---
             screen_desc = response.get("screen_description", "")
+            
+            pending = response.get("pending_fields") or []
+            if pending:
+                self._log(f"📋 Pending fields: {pending}")
+                self._conversation_context.append(
+                    f"System paused: missing fields {pending}. Waiting for user input."
+                )
+
+            visible_results = response.get("visible_results") or []
+            has_more = response.get("has_more_results", False)
 
             # Determine if we should show the accessibility panel
             is_impaired = self._demo_mode.get() or sq or ln
 
             if is_impaired:
                 self._set_description(screen_desc)
-                self.root.after(0, self._rebuild_keypad, targets, mon)
+                display_targets = visible_results if visible_results else targets
+                self.root.after(0, self._rebuild_keypad, display_targets, mon)
             else:
                 self._set_description("")
                 self.root.after(0, self._rebuild_keypad, [], mon)
 
+            if visible_results and not selected:
+                summary_parts = [f"I can see {len(visible_results)} results."]
+                for i, r in enumerate(visible_results, 1):
+                    summary_parts.append(f"Option {i}: {r.get('label', '')}.")
+                if has_more:
+                    summary_parts.append("There are more results below. Say 'scroll down' to see them.")
+                self.voice.speak(" ".join(summary_parts))
+                self._log(f"📊 Summarized {len(visible_results)} results (more={has_more})")
+
+            # --- CAPTCHA CHECK ---
+            if response.get("captcha_detected"):
+                self._set_engine_status("⚠ CAPTCHA detected", Palette.WARNING)
+                self._log("⚠ Halted for manual CAPTCHA completion.")
+                return
+
             # --- Step 7: Execute clicks for selected targets ---
             self._set_engine_status("Executing actions…", Palette.WARNING)
             for target in selected:
-                if target and isinstance(target, dict) and target.get("box_2d"):
-                    box = target["box_2d"]
-                    if isinstance(box, list) and len(box) == 4:
+                if target and isinstance(target, dict):
+                    box = target.get("box_2d")
+                    has_box = isinstance(box, list) and len(box) == 4
+                    has_scroll = bool(target.get("scroll_direction"))
+                    has_keys = bool(target.get("press_keys"))
+                    
+                    if not (has_box or has_scroll or has_keys):
+                        continue
+
+                    if target.get("requires_confirmation"):
+                        self._log(f"🛡️ Confirmation required for '{target.get('name', '?')}'")
+                        self.voice.speak(f"Please confirm: {target.get('name', '?')}. Say yes to confirm.", block=True)
+                        conf_ans, _ = self._listen_for_reply(timeout=8)
+                        if "yes" not in (conf_ans or "").lower():
+                            self._log(f"❌ Action cancelled by user (heard: '{conf_ans}')")
+                            self.voice.speak("Action cancelled.", block=True)
+                            continue
+                        self._log("✅ Action confirmed by user.")
+
+                    # --- Handle Scroll Direction ---
+                    scroll_dir = target.get("scroll_direction")
+                    if scroll_dir in ["down", "up"]:
+                        self._log(f"Scrolling {scroll_dir.upper()} for target '{target.get('name', '?')}'")
+                        # Click center of screen to ensure browser has focus (not the overlay)
+                        inject_click(0.5, 0.5, mon, self.root)
+                        time.sleep(0.3)
+                        inject_scroll(scroll_dir)
+                        time.sleep(1.0)
+                        # If we have a box to click, we need a new screenshot to verify anchor
+                        if has_box:
+                            pass # Anchor verification below will find new coords
+
+                    if has_box:
                         try:
                             box = [float(v) for v in box]
                             ymin, xmin, ymax, xmax = box
                         except (ValueError, TypeError):
                             self._log(f"⚠ Invalid coords type for '{target.get('name', '?')}': {box}")
-                            continue
+                            has_box = False
 
+                    if has_box:
                         # --- Coordinate validation ---
                         if not all(0 <= v <= 1000 for v in box):
                             self._log(f"⚠ Invalid coords for '{target.get('name', '?')}': {box} (out of range)")
-                            continue
-                        if ymax <= ymin or xmax <= xmin:
+                            has_box = False
+                        elif ymax <= ymin or xmax <= xmin:
                             self._log(f"⚠ Invalid box for '{target.get('name', '?')}': {box} (inverted/zero)")
-                            continue
-                        center_y = (ymin + ymax) / 2
-                        if center_y > 960:
-                            self._log(f"⚠ Skipping '{target.get('name', '?')}': coords ({box}) point to taskbar area")
-                            continue
+                            has_box = False
+                        else:
+                            center_y = (ymin + ymax) / 2
+                            if center_y > 960:
+                                self._log(f"⚠ Skipping '{target.get('name', '?')}': coords ({box}) point to taskbar area")
+                                has_box = False
 
+                    if has_box:
                         # --- Visual Anchor Verification ---
-                        # Re-verify target position to handle scroll drift
                         verified_box = verify_anchor(
                             target.get('name', ''),
                             box, mon, hide_window=None
                         )
                         if verified_box is None:
                             self._log(f"⚠ Anchor lost for '{target.get('name', '?')}' — skipping click")
-                            continue
-                        if verified_box != box:
-                            self._log(f"🔄 Anchor shifted for '{target.get('name', '?')}': {box} → {verified_box}")
-                            box = verified_box
-                            ymin, xmin, ymax, xmax = [float(v) for v in box]
+                            has_box = False
+                        else:
+                            if verified_box != box:
+                                self._log(f"🔄 Anchor shifted for '{target.get('name', '?')}': {box} → {verified_box}")
+                                box = verified_box
+                                ymin, xmin, ymax, xmax = [float(v) for v in box]
 
-                        nx = ((xmin + xmax) / 2) / 1000.0
-                        ny = ((ymin + ymax) / 2) / 1000.0
-                        self._log(f"Click -> '{target.get('name', '?')}' at ({nx:.3f}, {ny:.3f})")
-                        inject_click(nx, ny, mon)
-                        time.sleep(0.3)
-
-                        # If Gemini says to type text into this field, do it
-                        text_to_type = target.get("type_text")
-                        if text_to_type and isinstance(text_to_type, str):
-                            self._log(f"Typing -> '{text_to_type}'")
-                            inject_text(text_to_type)
-                            time.sleep(0.2)
-
-                        # If Gemini says to press keys (for dropdowns, autocomplete, etc.)
-                        keys_to_press = target.get("press_keys")
-                        if keys_to_press and isinstance(keys_to_press, list):
-                            self._log(f"Keys -> {keys_to_press}")
-                            inject_keys(keys_to_press)
+                            nx = ((xmin + xmax) / 2) / 1000.0
+                            ny = ((ymin + ymax) / 2) / 1000.0
+                            self._log(f"Click -> '{target.get('name', '?')}' at ({nx:.3f}, {ny:.3f})")
+                            inject_click(nx, ny, mon, self.root)
                             time.sleep(0.3)
 
-                        # If Gemini says a follow-up is needed (e.g. dropdown opened,
-                        # need to take a new screenshot to find the right option)
-                        follow_up = target.get("follow_up")
-                        if follow_up and isinstance(follow_up, str):
-                            self._log(f"Follow-up: {follow_up}")
-                            self._set_engine_status("Re-scanning dropdown...", Palette.WARNING)
+                            type_text = target.get("type_text")
+                            if type_text and isinstance(type_text, str):
+                                self._log(f"Typing -> '{type_text}'")
+                                inject_keys(["ctrl+a", "backspace"])
+                                time.sleep(0.2)
+                                inject_text(type_text)
+                                time.sleep(0.3)
 
-                            # Wait for dropdown animation to complete
-                            time.sleep(2.5)
+                    keys_to_press = target.get("press_keys")
+                    if keys_to_press and isinstance(keys_to_press, list):
+                        self._log(f"Keys -> {keys_to_press}")
+                        inject_keys(keys_to_press)
+                        time.sleep(0.3)
 
-                            # Take a new screenshot (do not hide overlay to prevent stealing focus and closing the dropdown)
-                            img2, mon2 = capture_screen(hide_window=None)
-                            self._log(f"Second screenshot captured ({img2.size[0]}x{img2.size[1]})")
+                    # If Gemini says a follow-up is needed (e.g. dropdown opened,
+                    # need to take a new screenshot to find the right option)
+                    follow_up = target.get("follow_up")
+                    if follow_up and isinstance(follow_up, str):
+                        self._log(f"Follow-up: {follow_up}")
+                        self._set_engine_status("Re-scanning dropdown...", Palette.WARNING)
 
-                            # Ask Gemini to find the specific option
-                            fu_result = analyze_follow_up(img2, follow_up)
-                            if fu_result and fu_result.get("box_2d"):
-                                fu_box = fu_result["box_2d"]
-                                fu_name = fu_result.get("name", "?")
-                                if isinstance(fu_box, list) and len(fu_box) == 4:
-                                    try:
-                                        fy1, fx1, fy2, fx2 = [float(v) for v in fu_box]
-                                        fu_nx = ((fx1 + fx2) / 2) / 1000.0
-                                        fu_ny = ((fy1 + fy2) / 2) / 1000.0
-                                        self._log(f"Follow-up click -> '{fu_name}' at ({fu_nx:.3f}, {fu_ny:.3f})")
-                                        inject_click(fu_nx, fu_ny, mon2)
-                                        time.sleep(0.3)
-                                    except ValueError:
-                                        self._log("Follow-up: invalid coordinates returned")
+                        # Wait for dropdown animation to complete
+                        time.sleep(2.5)
+
+                        # Take a new screenshot (do not hide overlay to prevent stealing focus and closing the dropdown)
+                        img2, mon2 = capture_screen(hide_window=None)
+                        self._log(f"Second screenshot captured ({img2.size[0]}x{img2.size[1]})")
+
+                        # Decide if this is a dropdown options list or just a generic follow-up
+                        if any(k in follow_up.lower() for k in ["autocomplete", "suggestion", "station", "city"]):
+                            fu_result = analyze_dropdown_options(img2, follow_up, user_input)
+                            if fu_result and fu_result.get("options"):
+                                options = fu_result["options"]
+                                best_match = fu_result.get("best_match")
+                                
+                                if len(options) == 1:
+                                    target_to_click_str = options[0]
+                                elif best_match:
+                                    target_to_click_str = best_match
+                                    self._log(f"Matched best option: {best_match}")
+                                else:
+                                    # Ambiguous! Ask user.
+                                    option_names = options[:3]
+                                    ask_text = f"I see {', '.join(option_names)}. Which one?"
+                                    self.voice.speak(ask_text, block=True)
+                                    self._log(ask_text)
+                                    user_choice, _ = self._listen_for_reply(timeout=8)
+                                    
+                                    target_to_click_str = None
+                                    if user_choice:
+                                        user_choice_lower = user_choice.lower()
+                                        for opt in options:
+                                            if opt.lower() in user_choice_lower or user_choice_lower in opt.lower():
+                                                target_to_click_str = opt
+                                                break
+                                    if not target_to_click_str:
+                                        target_to_click_str = options[0]
+                                        
+                                self._log(f"Resolving coordinates for: {target_to_click_str}")
+                                fu_result = analyze_follow_up(img2, f"Click on the option '{target_to_click_str}'")
+                                if fu_result:
+                                    fu_box = fu_result.get("box_2d")
+                                    fu_name = fu_result.get("name", target_to_click_str)
+                                else:
+                                    fu_box = None
+                                    fu_name = target_to_click_str
                             else:
-                                self._log("Follow-up: option not found in dropdown")
+                                fu_box = None
+                                fu_name = "?"
+                        else:
+                            # Standard single-target follow-up
+                            fu_result = analyze_follow_up(img2, follow_up)
+                            if fu_result:
+                                fu_box = fu_result.get("box_2d")
+                                fu_name = fu_result.get("name", "?")
+                            else:
+                                fu_box = None
+                                fu_name = "?"
+
+                        if fu_box and isinstance(fu_box, list) and len(fu_box) == 4:
+                            try:
+                                fy1, fx1, fy2, fx2 = [float(v) for v in fu_box]
+                                fu_nx = ((fx1 + fx2) / 2) / 1000.0
+                                fu_ny = ((fy1 + fy2) / 2) / 1000.0
+                                self._log(f"Follow-up click -> '{fu_name}' at ({fu_nx:.3f}, {fu_ny:.3f})")
+                                inject_click(fu_nx, fu_ny, mon2, overlay_window=self.root)
+                                time.sleep(0.3)
+                            except ValueError:
+                                self._log("Follow-up: invalid coordinates returned")
+                        else:
+                            self._log("Follow-up: option not found in dropdown")
+
+            # --- Page Guidance Narration ---
+            page_guidance = response.get("page_guidance")
+            if page_guidance and selected and self._guide_mode_enabled.get():
+                time.sleep(1.5)
+                wait_for_stable_screen(timeout=3.0, interval=0.3)
+                self._log(f"📖 Page guidance: {page_guidance}")
+                self.voice.speak(page_guidance)
 
             self._set_engine_status("Done", Palette.SUCCESS)
+            self._play_success_sound()
+            
+            # --- Conversational Turn ---
+            if response.get("expects_response"):
+                self._log("🔄 Conversational turn — waiting for reply...")
+                user_reply, _ = self._listen_for_reply(timeout=8)
+                if user_reply:
+                    self._log(f"Received reply: '{user_reply}'")
+                    self.root.after(0, self.run_cycle_async, user_reply)
+            # Maintain rolling conversation memory (last 5 cycles)
+            action_desc = f"User said: '{user_input}'"
+            if selected:
+                action_desc += f" -> System acted on {len(selected)} target(s)."
+            self._conversation_context.append(action_desc)
+            if len(self._conversation_context) > 5:
+                self._conversation_context.pop(0)
+
             # Record success for escalation tracking
             self._escalation.record_success()
 
@@ -933,9 +1328,11 @@ class OverlayApp:
             print(f"[Overlay] run_cycle error: {exc}")
             self._set_engine_status(f"❌ {exc}", Palette.ERROR)
             self._log(f"❌ Error: {exc}")
+            self._play_error_sound()
             # Record failure for escalation tracking
             self._escalation.record_failure(str(exc))
         finally:
+            self._is_processing = False
             if not self._cycle_had_error:
                 self._set_voice_status("Ready", Palette.SUCCESS)
                 self._set_engine_status("Idle", Palette.SUCCESS)
@@ -955,6 +1352,8 @@ class OverlayApp:
     # ══════════════════════════════════════════════════════════════════════
     def on_closing(self):
         self.running = False
+        if self._wake_stop_fn:
+            self._wake_stop_fn(wait_for_stop=False)
         if hasattr(self, '_proactive'):
             self._proactive.stop()
         if self.vision:
