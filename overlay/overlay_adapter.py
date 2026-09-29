@@ -24,6 +24,7 @@ def inject_click(normalized_x: float, normalized_y: float, monitor_info: dict, o
 
     # Check for occlusion with overlay window
     was_hidden = False
+    top_hwnd = None
     if overlay_window:
         try:
             if hasattr(overlay_window, 'winfo_rootx'):
@@ -31,12 +32,15 @@ def inject_click(normalized_x: float, normalized_y: float, monitor_info: dict, o
                 wy = overlay_window.winfo_rooty()
                 ww = overlay_window.winfo_width()
                 wh = overlay_window.winfo_height()
-                if (wx <= target_x <= wx + ww) and (wy <= target_y <= wy + wh):
-                    print(f"[Adapter] ⚠️ Target ({target_x}, {target_y}) is under overlay! Briefly withdrawing...")
-                    overlay_window.withdraw()
-                    overlay_window.update()
+                if (wx - 15 <= target_x <= wx + ww + 15) and (wy - 15 <= target_y <= wy + wh + 15):
+                    print(f"[Adapter] ⚠️ Target ({target_x}, {target_y}) is under overlay! Hiding overlay at OS level...")
+                    import ctypes
+                    child_hwnd = overlay_window.winfo_id()
+                    top_hwnd = ctypes.windll.user32.GetAncestor(child_hwnd, 3) or child_hwnd
+                    # SW_HIDE (0) hides window at the OS/DWM level across threads immediately
+                    ctypes.windll.user32.ShowWindow(top_hwnd, 0)
                     was_hidden = True
-                    time.sleep(0.15)
+                    time.sleep(0.12)
         except Exception as e:
             print(f"[Adapter] Notice checking overlay bounds: {e}")
 
@@ -49,14 +53,17 @@ def inject_click(normalized_x: float, normalized_y: float, monitor_info: dict, o
     time.sleep(0.05)
     pyautogui.mouseUp()
     
-    if was_hidden and overlay_window:
+    if was_hidden:
         try:
             print("[Adapter] Restoring overlay...")
-            overlay_window.deiconify()
-            overlay_window.update()
+            import ctypes
+            if top_hwnd:
+                ctypes.windll.user32.ShowWindow(top_hwnd, 5)  # SW_SHOW
+            if hasattr(overlay_window, 'after'):
+                overlay_window.after(0, overlay_window.deiconify)
             time.sleep(0.08)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[Adapter] Error restoring overlay: {e}")
 
 
 def inject_text(text: str):
@@ -73,9 +80,20 @@ def inject_text(text: str):
     # Brief pause to let the target field fully gain focus after a click
     time.sleep(0.25)
 
-    # Select all existing text first so new text replaces it (prevents appending)
-    pyautogui.hotkey('ctrl', 'a')
-    time.sleep(0.05)
+    # --- SMART OTP / PIN INJECTION ---
+    # If the text is purely numeric (like an OTP), we DO NOT use Ctrl+A.
+    # Ctrl+A breaks segmented React/Vue OTP inputs (deselects or selects the page).
+    # Instead, we rely on clipboard paste (Ctrl+V) which modern web inputs handle cleanly.
+    if text.isdigit():
+        print(f"[Adapter] Smart OTP injection (Clipboard Paste): '{text}'")
+        import subprocess
+        subprocess.run(['clip'], input=text.encode('utf-16-le'), check=True, creationflags=0x08000000)
+        time.sleep(0.1)
+        pyautogui.hotkey('ctrl', 'v')
+        return
+
+    # We DO NOT use Ctrl+A here anymore because it breaks focus on React/SPA sites.
+    # The agent uses `clear_first=true` in its JSON to explicitly clear fields beforehand.
 
     # Check if text is pure ASCII — pyautogui.write() only handles ASCII
     try:

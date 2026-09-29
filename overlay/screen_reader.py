@@ -3,6 +3,7 @@ import io
 import re
 import json
 import time
+from datetime import datetime
 import base64
 import mss
 from PIL import Image
@@ -61,121 +62,108 @@ except ImportError:
 # KEY FIX: every item in 'targets' now includes its own box_2d so that
 #           the virtual keypad buttons can inject clicks without a second scan.
 # ─────────────────────────────────────────────────────────────────────────────
-SYSTEM_PROMPT = """You are the UIAA Accessibility Overlay Agent.
-You are observing the user's screen via a screenshot of their desktop.
-The user's voice input and accessibility state will also be provided.
+SYSTEM_PROMPT = """You are the UIAA Accessibility Agent controlling a web browser.
+You observe the user's screen via a screenshot and help them complete tasks step-by-step.
 
-IMPORTANT INSTRUCTIONS FOR COORDINATE ACCURACY:
-- You are looking at a screenshot of the ENTIRE monitor.
-- The main application or kiosk is the large window in the center of the screen.
-- IGNORE any small floating dark-themed panel (the UIAA Overlay panel) — it is part of the accessibility system, not the target application.
-- IGNORE the Windows taskbar at the bottom/top of the screen.
-- Focus ONLY on the main application window when identifying targets and calculating coordinates.
-- Place box_2d coordinates precisely on the CENTER of each button/link text, not on its edges.
-- Double-check your coordinates before returning them. Accuracy is critical — these will be used for mouse click injection.
+COORDINATE RULES:
+- Screenshot shows the ENTIRE monitor. IGNORE the small dark UIAA Overlay panel and Windows taskbar.
+- box_2d = [ymin, xmin, ymax, xmax] integers 0-1000 on a normalised 1000×1000 grid of the full screenshot.
+- Target the CENTER of the element precisely.
 
-Return ONLY a single valid JSON object — no markdown, no code fences, no extra text.
-
-JSON Schema:
+Return ONLY a single valid JSON object matching this schema:
 {
-    "screen_description": "Short plain-English summary of what is on screen",
-    "speech_response": "What the TTS engine should read aloud to the user",
-    "is_sensitive": false,
-    "captcha_detected": false,
-    "pending_fields": ["Description of unfilled required fields, or empty array"],
-    "visible_results": [
-        {
-            "label": "Short human-readable label (e.g., 'Kerala Express - Dep 15:30 - 3A Available')",
-            "name": "Target name for clicking (e.g., 'Book Now for Kerala Express')",
-            "box_2d": [ymin, xmin, ymax, xmax]
-        }
-    ],
-    "has_more_results": false,
-    "page_guidance": "Brief orientation for the user after a page change, or null",
-    "expects_response": false,
-    "targets": [
-        {
-            "name": "Label of the button, link, or input field",
-            "type": "button | input | link | text",
-            "box_2d": [ymin, xmin, ymax, xmax]
-        }
-    ],
-    "selected_targets": [
-        {
-            "name": "The target(s) matched to the user's request",
-            "box_2d": "[ymin, xmin, ymax, xmax] or null if purely scrolling/keyboard",
-            "type_text": "Text to type into the field after clicking, or null",
-            "press_keys": ["key1", "key2"],
-            "follow_up": "Description of what to click next after this action opens a menu/dropdown, or null",
-            "scroll_direction": "Set to 'down' or 'up' ONLY if you need to scroll the page BEFORE finding the target, otherwise null",
-            "requires_confirmation": false
-        }
-    ]
+  "form_plan": {
+    "form_type": "e.g. train_booking, login, search",
+    "explicit_user_values_extracted": {"field_name": "EXACT value user spoke, or null if NOT explicitly stated"},
+    "required_missing": ["List all mandatory fields that map to null above"]
+  },
+  "observation": "What I see on the screen right now (e.g., popups, forms, loading spinners)",
+  "reasoning": "Step-by-step logic. If required fields are null, I must ask. If a popup is blocking, I must close it. Otherwise, explain the action.",
+  "task_status": "in_progress",
+  "action": {
+    "type": "click" | "type" | "select" | "scroll" | "key_press" | "wait" | "none",
+    "target_description": "e.g. From station input field",
+    "box_2d": [ymin, xmin, ymax, xmax],
+    "text": "text to type (null if not typing)",
+    "keys": ["key names for key_press"],
+    "scroll_direction": "up" | "down",
+    "clear_first": false,
+    "requires_confirmation": false
+  },
+  "speech": "Brief message to speak aloud to the user",
+  "is_sensitive": false,
+  "expected_result": "What should change on screen after this action",
+  "max_wait_ms": 3000,
+  "expects_response": false
 }
 
-Rules:
-- box_2d values are integers 0-1000 representing [ymin, xmin, ymax, xmax] on a 1000x1000 grid.
-- The grid maps to the FULL screenshot: (0,0) is top-left of the monitor, (1000,1000) is bottom-right.
-- If you need to scroll to find something not visible, return a dummy box_2d like [500,500,500,500] and set scroll_direction to 'down' or 'up'.
-- is_sensitive: set to true when the speech_response contains private data such as PINs, passwords, account numbers, balances, or OTPs. Otherwise false.
-- captcha_detected: set to true if there is a CAPTCHA challenge visible. Set speech_response to instruct the user to complete it manually and say 'done'.
-- requires_confirmation: set to true for high-risk actions (e.g., Pay, Submit, Confirm, Transfer, Delete, Book Ticket). The overlay will ask the user for confirmation before clicking.
+=== CRITICAL RULES ===
 
-CONVERSATIONAL RULES:
-- If you ask the user a question in your speech_response (e.g. "Which time do you prefer?", "Would you like to book this?"), you MUST set "expects_response" to true.
-- If you set "expects_response" to true, DO NOT execute any actions that depend on their answer. Set selected_targets to [] until they reply.
+0. ABSOLUTE RULE - NEVER INVENT DATA: You may ONLY type or select values that the user has EXPLICITLY stated in their voice input or conversation replies. If the user said 'book tickets' without specifying origin, destination, date, or any other field — you MUST set task_status='needs_input' and ASK. You are FORBIDDEN from guessing, assuming, or using placeholder values like 'Mumbai', 'Delhi', or any default date. If you don't have the data, ASK for it.
 
-SCROLLING & KEYBOARD ONLY:
-- If the user asks to "scroll down", "go back", or "press enter", and NO click is needed, you can return a target with "box_2d": null, and set "scroll_direction" (e.g. "down") or "press_keys" (e.g. ["escape"]). The system will execute the scroll/keys without clicking.
-- EVERY item in 'targets' MUST have its own box_2d. Do not omit any.
-- Make bounding boxes TIGHT around the clickable element — do not use overly large boxes.
-- Leave 'selected_targets' as an empty array [] when the user is only asking what is available (not requesting an action).
-- Never return null for selected_targets — always use an empty array [].
-- When the user just wants to click a button or link with no text entry, set "type_text" to null.
+1. ONE ACTION PER STEP. Never try to fill multiple fields in one response.
 
-TEXT INPUT RULES:
-- When the user's voice input implies typing into a field (e.g. "from Chengannur", "enter 5000", "search for trains"), set "type_text" to ONLY the value to type (e.g. "Chengannur", "5000", "trains").
-- The system will automatically clear any existing text in the field before typing.
-- MULTIPLE ACTIONS: If the user request involves filling multiple fields (e.g. 'from X to Y'), you MUST return multiple objects in selected_targets (e.g. one for From, one for To). The system will execute them in order.
-- IMPORTANT: Identify the CORRECT target field from context. "from Chengannur" means the FROM/SOURCE field. "to Trivandrum" means the TO/DESTINATION field. Do NOT just type into whatever field is currently active — click the RIGHT field first.
+2. FORM PLANNING (form_plan):
+   - In explicit_user_values_extracted, create a key for every required field on screen (e.g., 'From', 'To', 'Date').
+   - For each key, extract the EXACT string the user spoke. If the user did NOT mention it, map it to `null`.
+   - required_missing MUST contain every field that mapped to `null`.
+   - For travel booking: required fields typically include origin, destination, date, class, passengers.
 
-KEYBOARD ACTIONS (press_keys):
-- press_keys is an array of keyboard keys to press AFTER the click and optional typing are done.
-- Supported keys: "enter", "tab", "down", "up", "left", "right", "escape", "backspace", "delete", "space", "home", "end", "pageup", "pagedown"
-- Special: "wait:N" pauses for N milliseconds (e.g. "wait:1000" waits 1 second).
-- Set press_keys to null or omit it when no keyboard action is needed.
+3. NEVER CLICK SEARCH/SUBMIT WHILE required_missing IS NON-EMPTY.
+   Instead: set task_status="needs_input", action.type="none", expects_response=true.
+   In speech, ask the user for ALL missing fields at once. Example:
+   "I still need your travel date and preferred class. Could you tell me?"
 
-CRITICAL RULES FOR DROPDOWNS AND AUTOCOMPLETE:
-- For AUTOCOMPLETE/SEARCH input fields (station name, city, etc.): after setting type_text, set follow_up to describe which suggestion to select (e.g. "Select CHENGANNUR - CGNR from the autocomplete suggestions" or "Click the first matching station suggestion"). The system will type the text, wait for the suggestion dropdown to appear, take a NEW screenshot, and click the correct suggestion. Do NOT use press_keys for autocomplete — many websites require an actual click on the suggestion.
-- For DROPDOWN/SELECT menus (class selection, quota, etc.): You CANNOT see the dropdown options before they open. Set follow_up to describe what option to click (e.g. "Click on Third AC (3A)" or "Select Second AC (2A)"). The system will click the dropdown, wait for it to open, take a NEW screenshot, and use your follow_up instruction to find and click the correct option.
-- Set follow_up to null when no second action is needed (most cases — buttons, links, etc.).
-- For DATE PICKERS: click the date input field. Use press_keys to navigate if needed.
-- NEVER guess how many arrow-down presses are needed for a dropdown — you cannot see the options.
+3b. PRE-SEARCH / PRE-SUBMIT CONFIRMATION (CRITICAL ACCESSIBILITY RULE):
+   NEVER click the final 'Search', 'Find Trains', 'Book', or 'Submit' button silently or automatically!
+   Even when all mandatory fields (From, To, Date) are filled, travel websites have default optional fields (Class, Quota, Passengers).
+   You MUST pause, set task_status="needs_input", expects_response=true, action.type="none".
+   In speech, clearly summarize what is filled, mention the default values of remaining fields, and ask if you can proceed:
+   Example: "I have set origin as Kochi, destination as Pune, and date as tomorrow. Class and Quota are currently set to All Classes and General. Shall I go ahead and search, or would you like to change anything?"
+   ONLY click Search AFTER the user explicitly replies to proceed (e.g., "yes", "search", "go ahead", "looks good").
 
-FORM COMPLETION CHECK:
-- Before including a Submit/Search/Find/Book button in selected_targets, CHECK if there are required form fields that appear empty or set to default values.
-- If you detect unfilled required fields (e.g., date field showing today's date on a travel booking form), DO NOT include the submit button in selected_targets. Instead:
-  1. Set selected_targets to []
-  2. Set pending_fields to describe what's missing
-  3. Set speech_response to ask the user for the missing information
-- Only include Submit/Search when ALL visible required fields appear filled with user-intended values.
+4. DROPDOWN / AUTOCOMPLETE HANDLING:
+   - When you type into a field that triggers a dropdown (e.g., station name autocomplete):
+     Step A: type the text → set task_status="in_progress" (the dropdown will appear).
+     Step B (next iteration): You will see the dropdown list. Click the BEST matching option.
+     If multiple similar options exist (e.g., "Trivandrum Central" vs "Trivandrum Pettah"), 
+     set task_status="needs_input", expects_response=true, and ASK the user which one.
 
-RESULT LISTS:
-- When the screen shows a list of results (trains, flights, products), populate "visible_results" with each distinct result visible. Include a human-readable label (train name + time + availability).
-- Set "has_more_results" to true if there appears to be a scroll area indicating more results below.
-- If availability is not loaded (shows "Refresh"), mention this in the label.
-- Set visible_results to [] when not showing a results list.
+5. FORM FIELDS:
+   - If a field already contains text and you need to replace it, set clear_first=true.
+   - After typing, do NOT press Enter unless the field explicitly requires it.
 
-PAGE GUIDANCE:
-- When the user's action will cause a page navigation or major UI change (clicking Search, Submit, Next), set page_guidance to a brief 1-2 sentence orientation describing:
-  1. What the new page/section shows
-  2. Any non-obvious required actions (e.g., "Seat availability needs to be refreshed")
-  3. A suggested next step
-- Set page_guidance to null for simple in-page actions.
+6. DATE PICKERS / CALENDARS (ACCURACY RULES):
+   - PREFER TYPING: If the date input field can be typed into directly, click the field and TYPE the date (e.g., DD/MM/YYYY or DD MMM) with clear_first=true. Typing is 100% accurate and avoids small target misclicks.
+   - CALENDAR GRID CLICKS: If you must click a calendar day cell:
+     * NEVER target just the tiny number glyph.
+     * Your box_2d MUST cover the ENTIRE square date tile/cell so the click lands in the center of the tile.
+     * Verify the month name at the top of the calendar. If the desired date is in next month, click the '>' next-month arrow first.
+
+7. POPUPS, ADS, & BLOCKERS:
+   - If a modal popup, advertisement, "Sign in", or "Special Offer" dialog is blocking the screen, your FIRST action must be to close it (look for an 'X' button, 'Skip', or 'Close'). Do not try to interact with the background form while a popup is active.
+
+8. task_status values:
+   - "in_progress": More steps needed. Keep going.
+   - "needs_input": Waiting for user info. Set action.type="none" and expects_response=true.
+   - "completed": Task finished. Set action.type="none" and give a summary speech.
+   - "blocked": Cannot proceed (e.g., CAPTCHA, login wall).
+   - "failed": Unrecoverable error.
+
+9. expects_response: Set true ONLY when you are asking the user a question and need their answer.
+
+10. STEP HISTORY: Review the step history carefully. It contains what was already done, what the agent asked, and what the user replied. Use user replies as input data for filling fields.
+
+11. is_sensitive: Set to true ONLY if the speech explicitly reads out a secret credential (passwords, PINs, OTPs, CVV). NEVER set to true when asking for an OTP, routine speech, or booking assistance.
+
+12. OTP & MULTI-BOX PIN FIELDS:
+    - If you see an OTP/PIN screen, ALWAYS ask the user for the code first if you don't have it (using task_status='needs_input' and expects_response=true).
+    - When you DO have the code, set action.type="type" with the exact digits.
+    - Target the FIRST (left-most) digit box if there are multiple boxes. The system uses clipboard paste to auto-distribute the full code across all boxes. NEVER target individual boxes separately.
 """
 
-# Gemini models to try in order (flash/lite only — Pro is no longer free tier)
-_MODEL_PRIORITY = ["gemini-3.1-flash-lite-preview", "gemini-2.5-flash"]
+# Gemini models to try in order (gemini-3.5-flash-lite has active quota; gemini-2.5-flash free daily is capped at 20)
+_MODEL_PRIORITY = ["gemini-3.5-flash-lite", "gemini-3.1-flash-lite-preview", "gemini-2.5-flash"]
 
 # OpenAI models to try as fallback (when ALL Gemini models fail)
 _OPENAI_MODEL_PRIORITY = ["gpt-4o-mini", "gpt-4o"]
@@ -288,58 +276,32 @@ def _strip_markdown_fences(text: str) -> str:
 
 
 def _normalise_response(parsed: dict) -> dict:
-    """Normalise selected_targets to always be a list of dicts with box_2d.
-
-    Handles all known edge cases from Gemini:
-    - selected_targets missing entirely
-    - selected_targets is the string "null"
-    - selected_targets is None
-    - selected_targets is a single dict instead of a list
-    - Old schema: selected_target (singular) instead of selected_targets
-    """
-    # --- Normalise selected_targets ---
-    st = parsed.get("selected_targets")
-
-    # Handle string "null" or "none"
-    if isinstance(st, str):
-        st = None
-
-    # Handle None / missing
-    if st is None:
-        st = []
-
-    # Handle single dict instead of list
-    if isinstance(st, dict):
-        st = [st]
-
-    # Ensure it's a list
-    if not isinstance(st, list):
-        st = []
-
-    # --- Fallback: old singular schema ---
-    old_target = parsed.get("selected_target")
-    if old_target and isinstance(old_target, dict) and not st:
-        st = [old_target]
-
-    # Filter out entries without valid box_2d
-    cleaned = []
-    for item in st:
-        if isinstance(item, dict) and item.get("box_2d"):
-            box = item["box_2d"]
-            if isinstance(box, list) and len(box) == 4:
-                cleaned.append(item)
-
-    parsed["selected_targets"] = cleaned
-
-    # --- Normalise targets too ---
-    targets = parsed.get("targets")
-    if not isinstance(targets, list):
-        parsed["targets"] = []
-
-    # Ensure screen_description, speech_response, and is_sensitive exist
-    parsed.setdefault("screen_description", "")
-    parsed.setdefault("speech_response", "")
+    """Normalise the ReAct response to ensure all expected fields exist."""
+    parsed.setdefault("form_plan", {"form_type": "unknown", "fields_on_screen": [], "fields_provided_by_user": [], "required_missing": []})
+    parsed.setdefault("observation", "")
+    parsed.setdefault("reasoning", "")
+    parsed.setdefault("task_status", "in_progress")
+    
+    action = parsed.get("action")
+    if not isinstance(action, dict):
+        action = {"type": "none"}
+    
+    action.setdefault("type", "none")
+    action.setdefault("target_description", "")
+    action.setdefault("box_2d", None)
+    action.setdefault("text", None)
+    action.setdefault("keys", None)
+    action.setdefault("scroll_direction", None)
+    action.setdefault("clear_first", False)
+    action.setdefault("requires_confirmation", False)
+    
+    parsed["action"] = action
+    
+    parsed.setdefault("speech", "")
     parsed.setdefault("is_sensitive", False)
+    parsed.setdefault("expected_result", "")
+    parsed.setdefault("max_wait_ms", 3000)
+    parsed.setdefault("expects_response", False)
 
     return parsed
 
@@ -347,27 +309,36 @@ def _normalise_response(parsed: dict) -> dict:
 def analyze_screen_and_intent(screenshot: Image.Image,
                                user_voice_text: str,
                                user_state: dict,
-                               conversation_context: list = None) -> dict | None:
+                               conversation_context: list = None,
+                               step_history: list = None) -> dict | None:
     """Sends screenshot + voice text to Gemini Vision and returns parsed JSON."""
     client = get_gemini_client()
     if client is None:
         print("[ScreenReader] No Gemini client — API key missing.")
         return None
 
-    # Convert PIL image → raw PNG bytes for the new SDK
+    # Compress and resize screenshot to save bandwidth and API latency
+    max_size = (1600, 1600)
+    img_copy = screenshot.copy()
+    img_copy.thumbnail(max_size, Image.Resampling.LANCZOS)
     buf = io.BytesIO()
-    screenshot.save(buf, format="PNG")
+    img_copy.convert("RGB").save(buf, format="JPEG", quality=85)
     image_bytes = buf.getvalue()
 
     context_str = ""
     if conversation_context:
         context_str = "Recent Interaction History:\n" + "\n".join(f"- {c}" for c in conversation_context)
 
+    step_history_str = ""
+    if step_history:
+        step_history_str = "Steps taken so far for current request:\n" + "\n".join(f"{i+1}. {c}" for i, c in enumerate(step_history))
+
     contents = [
         SYSTEM_PROMPT,
-        types.Part.from_bytes(data=image_bytes, mime_type="image/png"),
-        f"User State Context: {json.dumps(user_state)}",
+        types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+        f"User State Context: {json.dumps(user_state)}\nToday's date is: {datetime.now().strftime('%A, %B %d, %Y')}. NEVER select or type a date in the past.",
         context_str,
+        step_history_str,
         f"User Voice Request: '{user_voice_text}'",
     ]
 
@@ -439,32 +410,37 @@ def analyze_screen_and_intent(screenshot: Image.Image,
                 error_str = str(e)
                 last_error = e
 
-                # Handle 429 rate-limit: wait and retry the same model
+                # Handle 429 rate-limit / quota exhaustion
                 if "429" in error_str or "RESOURCE_EXHAUSTED" in error_str:
-                    # Extract retry delay from error message if available
-                    wait_time = 10  # default wait
+                    # If daily quota is exhausted, sleeping won't help — switch models immediately!
+                    if any(kw in error_str.lower() for kw in ["perday", "limit: 20", "quota failure", "daily"]):
+                        print(f"[ScreenReader] Daily quota reached for {model_name}. Switching to next model immediately...")
+                        break
+
+                    # Otherwise it's a per-minute rate limit — wait briefly and retry
+                    wait_time = 5  # default wait
                     delay_match = re.search(r'retry(?:Delay)?.*?(\d+)', error_str)
                     if delay_match:
-                        wait_time = min(int(delay_match.group(1)), 60)
+                        wait_time = min(int(delay_match.group(1)), 30)
 
                     if attempt < _MAX_RATE_LIMIT_RETRIES:
-                        print(f"[ScreenReader] Rate limited on {model_name}. "
+                        print(f"[ScreenReader] Per-minute rate limit on {model_name}. "
                               f"Waiting {wait_time}s before retry...")
                         time.sleep(wait_time)
                         continue  # Retry same model
                     else:
-                        print(f"[ScreenReader] Rate limit exhausted for {model_name}.")
+                        print(f"[ScreenReader] Rate limit exhausted for {model_name}. Trying next model...")
                         break  # Try next model
 
-                # Handle 503 server overload: wait briefly and retry (transient)
-                elif "503" in error_str or "UNAVAILABLE" in error_str:
+                # Handle 503 server overload / high demand: wait briefly and retry or try next model
+                elif any(kw in error_str.lower() for kw in ["503", "unavailable", "high demand", "overloaded", "busy", "temporarily"]):
                     if attempt < _MAX_RATE_LIMIT_RETRIES:
-                        print(f"[ScreenReader] {model_name} temporarily unavailable. "
-                              f"Retrying in 5s...")
-                        time.sleep(5)
+                        print(f"[ScreenReader] {model_name} is experiencing high demand / temporarily busy. "
+                              f"Retrying in 2s...")
+                        time.sleep(2)
                         continue  # Retry same model
                     else:
-                        print(f"[ScreenReader] {model_name} still unavailable after retries.")
+                        print(f"[ScreenReader] {model_name} still overloaded after retries. Trying next model...")
                         break  # Try next model
 
                 # Handle 404: model doesn't exist — skip to next model immediately
@@ -664,14 +640,14 @@ def _call_openai_fallback(image_bytes: bytes,
                 {
                     "type": "image_url",
                     "image_url": {
-                        "url": f"data:image/png;base64,{b64_image}",
+                        "url": f"data:image/jpeg;base64,{b64_image}",
                         "detail": "high"
                     }
                 },
                 {
                     "type": "text",
                     "text": (
-                        f"User State Context: {json.dumps(user_state)}\n"
+                        f"User State Context: {json.dumps(user_state)}\nToday's date is: {datetime.now().strftime('%A, %B %d, %Y')}. NEVER select or type a date in the past.\n"
                         f"User Voice Request: '{user_voice_text}'"
                     )
                 }

@@ -110,6 +110,7 @@ class OverlayApp:
         self._lock = threading.Lock()
         self._adaptation_level = AdaptationLevel.NORMAL
         self._cycle_had_error = False
+        self._is_processing = False
         self._demo_mode = tk.BooleanVar(value=True)
         self._current_targets = []      # keep reference for re-rendering on adaptation change
         self._last_cycle_time = time.time()
@@ -241,12 +242,13 @@ class OverlayApp:
         self.guide_cb.pack(fill=tk.X, padx=12, pady=(0, 4))
 
         # ④ Voice Cycle Button
+        self._abort_requested = False
         self.btn_listen = tk.Button(
             root, text="🎤  Run Voice Cycle",
             font=self._fonts["keypad"],
             bg=Palette.ACCENT_DIM, fg="white", activebackground="#023e8a",
             relief=tk.FLAT, padx=14, pady=7, cursor="hand2",
-            command=self.run_cycle_async
+            command=self._toggle_run_cycle
         )
         self.btn_listen.pack(fill=tk.X, padx=12, pady=6)
 
@@ -370,7 +372,7 @@ class OverlayApp:
 
         # Start Proactive Monitor
         self._proactive = ProactiveMonitor(
-            get_state_fn=lambda: (self.vision.get_latest_state()
+            get_state_fn=lambda: (self.vision.user_state.copy()
                                   if self.vision else {}),
             trigger_fn=self._run_proactive_check,
             inactivity_threshold=30,
@@ -949,7 +951,7 @@ class OverlayApp:
         if self.btn_listen.cget("state") != tk.DISABLED:
             self.run_cycle_async(pre_transcribed_text=clean_text)
 
-    def _listen_for_reply(self, timeout: int = 8) -> tuple[str, str]:
+    def _listen_for_reply(self, timeout: int = 8, context: str = "") -> tuple[str, str]:
         """Reliably listens for a user reply.
         
         Pauses wake word listener, waits for TTS to fully finish,
@@ -975,7 +977,7 @@ class OverlayApp:
             # 4. Listen
             self._set_engine_status("🎙 Listening…", Palette.WARNING)
             self._log("🎙 Mic ON — waiting for your reply...")
-            reply, err = self.voice.listen_sync(timeout=timeout)
+            reply, err = self.voice.listen_sync(timeout=timeout, context=context)
             if reply:
                 self._log(f"🎙 Heard: '{reply}'")
             else:
@@ -991,20 +993,30 @@ class OverlayApp:
     # ══════════════════════════════════════════════════════════════════════
     # Main Pipeline — runs on background thread
     # ══════════════════════════════════════════════════════════════════════
+    def _toggle_run_cycle(self):
+        """Toggles the agent loop on or off."""
+        if self._is_processing:
+            self._log("🛑 User requested to stop the agent.")
+            self._abort_requested = True
+            self.btn_listen.config(text="Stopping...", state=tk.DISABLED, bg=Palette.WARNING)
+        else:
+            self._abort_requested = False
+            self.run_cycle_async()
+
     def run_cycle_async(self, pre_transcribed_text: str = None):
         """Dispatches the vision/voice cycle to a background thread."""
-        self.root.after(0, self.btn_listen.config, {"state": tk.DISABLED})
+        self.btn_listen.config(text="🛑 Stop Agent", bg=Palette.ERROR)
         threading.Thread(target=self.run_cycle, args=(pre_transcribed_text,), daemon=True).start()
 
     def run_cycle(self, pre_transcribed_text: str = None):
         self._cycle_had_error = False
         self._last_cycle_time = time.time()
+        self._is_processing = True
+        
         if hasattr(self, '_proactive'):
             self._proactive.record_cycle()
         try:
             # --- Step 1: Voice Input ---
-            self.root.after(0, self.btn_listen.config, {"state": tk.DISABLED})
-            
             if pre_transcribed_text:
                 self._log(f"🎤 Wake word triggered! Pre-transcribed: {pre_transcribed_text}")
                 user_input = pre_transcribed_text
@@ -1028,300 +1040,248 @@ class OverlayApp:
             self._set_transcript(user_input)
             self._log(f"🗣 Heard: \"{user_input}\"")
 
-            # --- Step 2: Capture screen (overlay hides briefly for clean screenshot) ---
-            self._set_engine_status("Capturing screen…", Palette.WARNING)
-            
-            # Wait passively for page animations to finish without blinking overlay
-            wait_for_stable_screen(timeout=2.5, interval=0.25)
-            
-            # Take clean screenshot with single brief overlay hide
-            img, mon = capture_screen(hide_window=self.root)
-            self.monitor_info = mon
-            self._log(f"📷 Screen captured ({img.size[0]}×{img.size[1]})")
+            task_status = "in_progress"
+            loop_count = 0
+            MAX_LOOPS = 15
+            step_history = []
+            conversation_turns = [f"User: {user_input}"]  # Track all conversation turns
+            recent_actions = []  # To track identical repeated actions
 
-            # --- Step 3: Read vision state ---
-            with self._lock:
-                state_copy = self.vision.user_state.copy() if self.vision else {}
-            st = "sitting" if state_copy.get("seated") else "standing"
-            pt = "down" if state_copy.get("looking_down") else ("up" if state_copy.get("looking_up") else "straight")
-            sq = state_copy.get("squinting", False)
-            ln = state_copy.get("leaning_forward", False)
-            self._log(f"👁 User state: {st}, pitch={pt}, squinting={sq}, leaning={ln}")
+            while task_status in ["in_progress", "needs_input"] and loop_count < MAX_LOOPS:
+                if self._abort_requested:
+                    self._log("🛑 Agent stopped by user.")
+                    task_status = "blocked"
+                    break
 
-            # --- Step 4: Call Gemini Vision ---
-            self._set_engine_status("Analysing with AI…", Palette.WARNING)
-            self._start_ai_pulse()
-            self._log("🧠 Sending to Gemini Vision…")
+                loop_count += 1
+                
+                # --- Step 2: Capture screen ---
+                self._set_engine_status(f"Step {loop_count}...", Palette.WARNING)
+                
+                # Wait passively for page animations to finish without blinking overlay
+                wait_for_stable_screen(timeout=2.5, interval=0.25)
+                
+                if self._abort_requested:
+                    break
 
-            response = analyze_screen_and_intent(img, user_input, state_copy, self._conversation_context)
-            
-            self._stop_ai_pulse()
+                # Take clean screenshot with single brief overlay hide
+                img, mon = capture_screen(hide_window=self.root)
+                self.monitor_info = mon
+                self._log(f"📷 Screen captured ({img.size[0]}×{img.size[1]})")
 
-            if not response:
-                self._cycle_had_error = True
-                if get_gemini_client() is None:
-                    err_msg = "API Key Missing"
-                    detail = "Please set GEMINI_API_KEY in overlay/.env"
-                else:
-                    err_msg = "AI Error"
-                    detail = "Gemini returned no valid response"
-                self._set_engine_status(f"❌ {err_msg}", Palette.ERROR)
-                self._log(f"❌ {detail}")
-                return
+                # --- Step 3: Read vision state ---
+                with self._lock:
+                    state_copy = self.vision.user_state.copy() if self.vision else {}
+                st = "sitting" if state_copy.get("seated") else "standing"
+                pt = "down" if state_copy.get("looking_down") else ("up" if state_copy.get("looking_up") else "straight")
+                sq = state_copy.get("squinting", False)
+                ln = state_copy.get("leaning_forward", False)
 
-            targets = response.get("targets") or []
-            selected = response.get("selected_targets") or []
-            self._log(f"🧠 Gemini responded: {len(targets)} targets, {len(selected)} selected")
+                # --- Step 4: Call Gemini Vision ---
+                self._set_engine_status(f"Analysing with AI (Step {loop_count})…", Palette.WARNING)
+                self._start_ai_pulse()
+                
+                # Build a clean combined input that includes all conversation turns
+                combined_input = "\n".join(conversation_turns)
+                
+                response = analyze_screen_and_intent(img, combined_input, state_copy, self._conversation_context, step_history)
+                
+                self._stop_ai_pulse()
 
-            # --- Step 5: Speak response (with privacy gate) ---
-            speech = response.get("speech_response", "")
-            is_sensitive = response.get("is_sensitive", False)
-            expects_reply = response.get("expects_response", False)
-            if speech:
-                spoken = self.voice.speak(speech, sensitive=is_sensitive, block=expects_reply)
-                if not spoken:
-                    # Sensitive data suppressed — show on screen instead
-                    self._show_sensitive_on_screen(speech)
-                    self._log(f"🔒 Sensitive (screen only): \"{speech[:60]}\"")
-                else:
-                    self._log(f"🔊 Speaking: \"{speech[:60]}{'…' if len(speech) > 60 else ''}\"")
-            # --- Step 6: Update UI ---
-            screen_desc = response.get("screen_description", "")
-            
-            pending = response.get("pending_fields") or []
-            if pending:
-                self._log(f"📋 Pending fields: {pending}")
-                self._conversation_context.append(
-                    f"System paused: missing fields {pending}. Waiting for user input."
-                )
+                if not response:
+                    self._log("⚠️ AI did not return a valid response — attempting 1 retry...")
+                    self.voice.speak("Just a moment, re-checking the screen...", block=False)
+                    time.sleep(2)
+                    response = analyze_screen_and_intent(img, combined_input, state_copy, self._conversation_context, step_history)
+                    if not response:
+                        self._cycle_had_error = True
+                        self._set_engine_status("❌ AI Busy", Palette.ERROR)
+                        self._log("❌ AI service temporarily busy or experiencing high demand.")
+                        self.voice.speak("I'm sorry, the AI service is experiencing high demand right now. Please try again in a moment.", block=True)
+                        task_status = "failed"
+                        break
 
-            visible_results = response.get("visible_results") or []
-            has_more = response.get("has_more_results", False)
+                task_status = response.get("task_status", "in_progress")
+                action = response.get("action", {})
+                reasoning = response.get('reasoning')
+                form_plan = response.get("form_plan", {})
+                
+                # --- Step 5: Speak response ---
+                speech = response.get("speech", "")
+                is_sensitive = response.get("is_sensitive", False)
+                expects_reply = response.get("expects_response", False)
 
-            # Determine if we should show the accessibility panel
-            is_impaired = self._demo_mode.get() or sq or ln
-
-            if is_impaired:
-                self._set_description(screen_desc)
-                display_targets = visible_results if visible_results else targets
-                self.root.after(0, self._rebuild_keypad, display_targets, mon)
-            else:
-                self._set_description("")
-                self.root.after(0, self._rebuild_keypad, [], mon)
-
-            if visible_results and not selected:
-                summary_parts = [f"I can see {len(visible_results)} results."]
-                for i, r in enumerate(visible_results, 1):
-                    summary_parts.append(f"Option {i}: {r.get('label', '')}.")
-                if has_more:
-                    summary_parts.append("There are more results below. Say 'scroll down' to see them.")
-                self.voice.speak(" ".join(summary_parts))
-                self._log(f"📊 Summarized {len(visible_results)} results (more={has_more})")
-
-            # --- CAPTCHA CHECK ---
-            if response.get("captcha_detected"):
-                self._set_engine_status("⚠ CAPTCHA detected", Palette.WARNING)
-                self._log("⚠ Halted for manual CAPTCHA completion.")
-                return
-
-            # --- Step 7: Execute clicks for selected targets ---
-            self._set_engine_status("Executing actions…", Palette.WARNING)
-            for target in selected:
-                if target and isinstance(target, dict):
-                    box = target.get("box_2d")
-                    has_box = isinstance(box, list) and len(box) == 4
-                    has_scroll = bool(target.get("scroll_direction"))
-                    has_keys = bool(target.get("press_keys"))
+                # Stuck-loop circuit breaker
+                a_type = action.get("type", "none")
+                a_target = action.get("target_description", "")
+                a_text = action.get("text", "")
+                
+                if a_type != "none":
+                    # Use a spatial grid to detect repeated actions in the same screen area.
+                    # This ignores LLM rephrasing of target_description but catches stuck loops.
+                    nx, ny = 0, 0
+                    box = action.get("box_2d")
+                    if box and len(box) == 4:
+                        nx = int((box[1] + box[3]) / 2 / 50)  # ~5% screen grid
+                        ny = int((box[0] + box[2]) / 2 / 50)
                     
-                    if not (has_box or has_scroll or has_keys):
-                        continue
+                    action_sig = (a_type, a_text, nx, ny)
+                    recent_actions.append(action_sig)
+                    if len(recent_actions) > 3:
+                        recent_actions.pop(0)
+                        
+                    if len(recent_actions) == 3 and len(set(recent_actions)) == 1:
+                        self._log("🚨 Circuit breaker tripped! Repeated identical actions.")
+                        task_status = "needs_input"
+                        expects_reply = True
+                        speech = "I seem to be stuck. Could you tell me what to do next?"
+                        action["type"] = "none"  # Prevent execution of the stuck action
+                        recent_actions.clear()
 
-                    if target.get("requires_confirmation"):
-                        self._log(f"🛡️ Confirmation required for '{target.get('name', '?')}'")
-                        self.voice.speak(f"Please confirm: {target.get('name', '?')}. Say yes to confirm.", block=True)
-                        conf_ans, _ = self._listen_for_reply(timeout=8)
+                if "?" in speech or task_status == "needs_input":
+                    expects_reply = True
+
+                self._log(f"🧠 Step {loop_count} Reasoning: {reasoning}")
+                if form_plan.get("fields_on_screen"):
+                    self._log(f"📋 Form fields: {', '.join(form_plan.get('fields_on_screen', []))}")
+                if form_plan.get("required_missing"):
+                    self._log(f"📋 Missing fields: {', '.join(form_plan.get('required_missing'))}")
+                
+                # Update history (concise, structured)
+                step_summary = f"[Step {loop_count}] Action: {action.get('type')} on '{action.get('target_description', '')}' | Status: {task_status}"
+                if action.get('text'):
+                    step_summary += f" | Typed: '{action.get('text')}'"
+                step_history.append(step_summary)
+                
+                if speech:
+                    spoken = self.voice.speak(speech, sensitive=is_sensitive, block=expects_reply)
+                    if not spoken:
+                        self._show_sensitive_on_screen(speech)
+                        self._log(f"🔒 Sensitive (screen only): \"{speech[:60]}\"")
+                    else:
+                        self._log(f"🔊 Speaking: \"{speech[:60]}{'…' if len(speech) > 60 else ''}\"")
+                
+                # Update UI Description
+                obs = response.get("observation", "")
+                is_impaired = self._demo_mode.get() or sq or ln
+                if is_impaired:
+                    self._set_description(obs)
+                else:
+                    self._set_description("")
+
+                # --- Execute Action ---
+                a_type = action.get("type", "none")
+                if a_type != "none":
+                    self._log(f"⚡ Executing: {a_type} on {action.get('target_description')}")
+                    
+                    if action.get("requires_confirmation"):
+                        self._log(f"🛡️ Confirmation required for '{action.get('target_description', '?')}'")
+                        self.voice.speak(f"Please confirm: {action.get('target_description', '?')}. Say yes to confirm.", block=True)
+                        conf_ans, _ = self._listen_for_reply(timeout=8, context="User is confirming an action with yes or no.")
                         if "yes" not in (conf_ans or "").lower():
-                            self._log(f"❌ Action cancelled by user (heard: '{conf_ans}')")
+                            self._log(f"❌ Action cancelled by user")
                             self.voice.speak("Action cancelled.", block=True)
-                            continue
+                            task_status = "failed"
+                            break
                         self._log("✅ Action confirmed by user.")
 
-                    # --- Handle Scroll Direction ---
-                    scroll_dir = target.get("scroll_direction")
-                    if scroll_dir in ["down", "up"]:
-                        self._log(f"Scrolling {scroll_dir.upper()} for target '{target.get('name', '?')}'")
-                        # Click center of screen to ensure browser has focus (not the overlay)
-                        inject_click(0.5, 0.5, mon, self.root)
-                        time.sleep(0.3)
-                        inject_scroll(scroll_dir)
-                        time.sleep(1.0)
-                        # If we have a box to click, we need a new screenshot to verify anchor
+                    box = action.get("box_2d")
+                    has_box = isinstance(box, list) and len(box) == 4
+                    
+                    if a_type == "scroll":
+                        scroll_dir = action.get("scroll_direction")
+                        if scroll_dir:
+                            # Move mouse to center so scroll events target the main window, but DO NOT click!
+                            # Clicking center blindly clicks ads or links, destroying the workflow.
+                            import pyautogui
+                            mon = self.monitor_info
+                            pyautogui.moveTo(mon['left'] + mon['width'] // 2, mon['top'] + mon['height'] // 2)
+                            inject_scroll(scroll_dir)
+                            wait_for_stable_screen(timeout=1.5, interval=0.1)
+                    
+                    elif a_type in ("click", "type", "select"):
                         if has_box:
-                            pass # Anchor verification below will find new coords
-
-                    if has_box:
-                        try:
-                            box = [float(v) for v in box]
-                            ymin, xmin, ymax, xmax = box
-                        except (ValueError, TypeError):
-                            self._log(f"⚠ Invalid coords type for '{target.get('name', '?')}': {box}")
-                            has_box = False
-
-                    if has_box:
-                        # --- Coordinate validation ---
-                        if not all(0 <= v <= 1000 for v in box):
-                            self._log(f"⚠ Invalid coords for '{target.get('name', '?')}': {box} (out of range)")
-                            has_box = False
-                        elif ymax <= ymin or xmax <= xmin:
-                            self._log(f"⚠ Invalid box for '{target.get('name', '?')}': {box} (inverted/zero)")
-                            has_box = False
-                        else:
-                            center_y = (ymin + ymax) / 2
-                            if center_y > 960:
-                                self._log(f"⚠ Skipping '{target.get('name', '?')}': coords ({box}) point to taskbar area")
-                                has_box = False
-
-                    if has_box:
-                        # --- Visual Anchor Verification ---
-                        verified_box = verify_anchor(
-                            target.get('name', ''),
-                            box, mon, hide_window=None
-                        )
-                        if verified_box is None:
-                            self._log(f"⚠ Anchor lost for '{target.get('name', '?')}' — skipping click")
-                            has_box = False
-                        else:
-                            if verified_box != box:
-                                self._log(f"🔄 Anchor shifted for '{target.get('name', '?')}': {box} → {verified_box}")
-                                box = verified_box
-                                ymin, xmin, ymax, xmax = [float(v) for v in box]
-
-                            nx = ((xmin + xmax) / 2) / 1000.0
-                            ny = ((ymin + ymax) / 2) / 1000.0
-                            self._log(f"Click -> '{target.get('name', '?')}' at ({nx:.3f}, {ny:.3f})")
-                            inject_click(nx, ny, mon, self.root)
-                            time.sleep(0.3)
-
-                            type_text = target.get("type_text")
-                            if type_text and isinstance(type_text, str):
-                                self._log(f"Typing -> '{type_text}'")
-                                inject_keys(["ctrl+a", "backspace"])
-                                time.sleep(0.2)
-                                inject_text(type_text)
-                                time.sleep(0.3)
-
-                    keys_to_press = target.get("press_keys")
-                    if keys_to_press and isinstance(keys_to_press, list):
-                        self._log(f"Keys -> {keys_to_press}")
-                        inject_keys(keys_to_press)
-                        time.sleep(0.3)
-
-                    # If Gemini says a follow-up is needed (e.g. dropdown opened,
-                    # need to take a new screenshot to find the right option)
-                    follow_up = target.get("follow_up")
-                    if follow_up and isinstance(follow_up, str):
-                        self._log(f"Follow-up: {follow_up}")
-                        self._set_engine_status("Re-scanning dropdown...", Palette.WARNING)
-
-                        # Wait for dropdown animation to complete
-                        time.sleep(2.5)
-
-                        # Take a new screenshot (do not hide overlay to prevent stealing focus and closing the dropdown)
-                        img2, mon2 = capture_screen(hide_window=None)
-                        self._log(f"Second screenshot captured ({img2.size[0]}x{img2.size[1]})")
-
-                        # Decide if this is a dropdown options list or just a generic follow-up
-                        if any(k in follow_up.lower() for k in ["autocomplete", "suggestion", "station", "city"]):
-                            fu_result = analyze_dropdown_options(img2, follow_up, user_input)
-                            if fu_result and fu_result.get("options"):
-                                options = fu_result["options"]
-                                best_match = fu_result.get("best_match")
-                                
-                                if len(options) == 1:
-                                    target_to_click_str = options[0]
-                                elif best_match:
-                                    target_to_click_str = best_match
-                                    self._log(f"Matched best option: {best_match}")
-                                else:
-                                    # Ambiguous! Ask user.
-                                    option_names = options[:3]
-                                    ask_text = f"I see {', '.join(option_names)}. Which one?"
-                                    self.voice.speak(ask_text, block=True)
-                                    self._log(ask_text)
-                                    user_choice, _ = self._listen_for_reply(timeout=8)
-                                    
-                                    target_to_click_str = None
-                                    if user_choice:
-                                        user_choice_lower = user_choice.lower()
-                                        for opt in options:
-                                            if opt.lower() in user_choice_lower or user_choice_lower in opt.lower():
-                                                target_to_click_str = opt
-                                                break
-                                    if not target_to_click_str:
-                                        target_to_click_str = options[0]
-                                        
-                                self._log(f"Resolving coordinates for: {target_to_click_str}")
-                                fu_result = analyze_follow_up(img2, f"Click on the option '{target_to_click_str}'")
-                                if fu_result:
-                                    fu_box = fu_result.get("box_2d")
-                                    fu_name = fu_result.get("name", target_to_click_str)
-                                else:
-                                    fu_box = None
-                                    fu_name = target_to_click_str
-                            else:
-                                fu_box = None
-                                fu_name = "?"
-                        else:
-                            # Standard single-target follow-up
-                            fu_result = analyze_follow_up(img2, follow_up)
-                            if fu_result:
-                                fu_box = fu_result.get("box_2d")
-                                fu_name = fu_result.get("name", "?")
-                            else:
-                                fu_box = None
-                                fu_name = "?"
-
-                        if fu_box and isinstance(fu_box, list) and len(fu_box) == 4:
                             try:
-                                fy1, fx1, fy2, fx2 = [float(v) for v in fu_box]
-                                fu_nx = ((fx1 + fx2) / 2) / 1000.0
-                                fu_ny = ((fy1 + fy2) / 2) / 1000.0
-                                self._log(f"Follow-up click -> '{fu_name}' at ({fu_nx:.3f}, {fu_ny:.3f})")
-                                inject_click(fu_nx, fu_ny, mon2, overlay_window=self.root)
-                                time.sleep(0.3)
-                            except ValueError:
-                                self._log("Follow-up: invalid coordinates returned")
-                        else:
-                            self._log("Follow-up: option not found in dropdown")
+                                box = [float(v) for v in box]
+                                ymin, xmin, ymax, xmax = box
+                                nx = ((xmin + xmax) / 2) / 1000.0
+                                ny = ((ymin + ymax) / 2) / 1000.0
+                                self._log(f"Clicking at ({nx:.3f}, {ny:.3f})")
+                                inject_click(nx, ny, mon, self.root)
+                                wait_for_stable_screen(timeout=1.0, interval=0.1)
+                                
+                                if a_type == "type":
+                                    text_to_type = action.get("text")
+                                    # If it's a numeric code, skip clear_first (since inject_text handles paste cleanly)
+                                    if action.get("clear_first") and not (text_to_type and str(text_to_type).isdigit()):
+                                        # Safely clear text without Ctrl+A (which often selects the whole page or loses focus on modern SPAs)
+                                        inject_keys(["end"])
+                                        pyautogui.press("backspace", presses=35, interval=0.01)
+                                        wait_for_stable_screen(timeout=0.3, interval=0.1)
+                                    if text_to_type:
+                                        self._log(f"Typing -> '{text_to_type}'")
+                                        inject_text(text_to_type)
+                            except Exception as e:
+                                self._log(f"⚠ Invalid coordinates or error clicking: {e}")
+                    
+                    elif a_type == "key_press":
+                        keys = action.get("keys")
+                        if keys:
+                            self._log(f"Keys -> {keys}")
+                            inject_keys(keys)
+                            
+                    wait_ms = action.get("max_wait_ms", 3000)
+                    if wait_ms > 0:
+                        wait_for_stable_screen(timeout=min(wait_ms / 1000.0, 5.0), interval=0.25)
 
-            # --- Page Guidance Narration ---
-            page_guidance = response.get("page_guidance")
-            if page_guidance and selected and self._guide_mode_enabled.get():
-                time.sleep(1.5)
-                wait_for_stable_screen(timeout=3.0, interval=0.3)
-                self._log(f"📖 Page guidance: {page_guidance}")
-                self.voice.speak(page_guidance)
+                if expects_reply:
+                    self._log("🔄 Conversational turn — waiting for reply...")
+                    self.btn_listen.config(text="🎙️ Listening...", bg=Palette.WARNING)
+                    user_reply, _ = self._listen_for_reply(timeout=10, context=f"Agent asked: {speech}. The user is replying with relevant information.")
+                    self.btn_listen.config(text="🛑 Stop Agent", bg=Palette.ERROR)
+                    
+                    if not user_reply and task_status == "needs_input":
+                        self._log("🎙️ No speech detected on first attempt, prompting once more...")
+                        self.voice.speak("Sorry, I didn't catch that. Could you please repeat?", block=True)
+                        self.btn_listen.config(text="🎙️ Listening...", bg=Palette.WARNING)
+                        user_reply, _ = self._listen_for_reply(timeout=10, context=f"Agent asked: {speech}. The user is repeating their reply.")
+                        self.btn_listen.config(text="🛑 Stop Agent", bg=Palette.ERROR)
 
-            self._set_engine_status("Done", Palette.SUCCESS)
-            self._play_success_sound()
-            
-            # --- Conversational Turn ---
-            if response.get("expects_response"):
-                self._log("🔄 Conversational turn — waiting for reply...")
-                user_reply, _ = self._listen_for_reply(timeout=8)
-                if user_reply:
-                    self._log(f"Received reply: '{user_reply}'")
-                    self.root.after(0, self.run_cycle_async, user_reply)
-            # Maintain rolling conversation memory (last 5 cycles)
-            action_desc = f"User said: '{user_input}'"
-            if selected:
-                action_desc += f" -> System acted on {len(selected)} target(s)."
+                    if user_reply:
+                        self._log(f"Received reply: '{user_reply}'")
+                        self._set_transcript(f"You: {user_input}\nAgent asked: {speech}\nYou replied: {user_reply}")
+                        
+                        # Add reply to conversation turns so Gemini sees it on next iteration
+                        conversation_turns.append(f"Agent asked: {speech}")
+                        conversation_turns.append(f"User replied: {user_reply}")
+                        step_history.append(f"[Conversation] Agent: '{speech}' → User: '{user_reply}'")
+                        
+                        if task_status == "needs_input":
+                            task_status = "in_progress"  # Resume loop with new info
+                    elif task_status == "needs_input":
+                        self._log("❌ No reply received for required input. Aborting task.")
+                        self.voice.speak("I didn't hear a reply. Pausing the task. Click Run Voice Cycle when you're ready.", block=True)
+                        task_status = "failed"
+                        break
+
+            if loop_count >= MAX_LOOPS:
+                self._log("⚠️ Max loop count reached. Exiting.")
+                task_status = "failed"
+
+            if task_status == "completed":
+                self._set_engine_status("Done", Palette.SUCCESS)
+                self._play_success_sound()
+                self._escalation.record_success()
+            else:
+                self._log(f"⚠️ Task ended with status: {task_status}")
+                if task_status in ["failed", "blocked"]:
+                     self._escalation.record_failure(f"Task {task_status}")
+                     self._play_error_sound()
+
+            action_desc = f"User said: '{user_input}' -> Completed in {loop_count} steps"
             self._conversation_context.append(action_desc)
             if len(self._conversation_context) > 5:
                 self._conversation_context.pop(0)
-
-            # Record success for escalation tracking
-            self._escalation.record_success()
 
         except Exception as exc:
             self._cycle_had_error = True
@@ -1329,22 +1289,25 @@ class OverlayApp:
             self._set_engine_status(f"❌ {exc}", Palette.ERROR)
             self._log(f"❌ Error: {exc}")
             self._play_error_sound()
-            # Record failure for escalation tracking
             self._escalation.record_failure(str(exc))
         finally:
             self._is_processing = False
+            self._abort_requested = False
             if not self._cycle_had_error:
                 self._set_voice_status("Ready", Palette.SUCCESS)
                 self._set_engine_status("Idle", Palette.SUCCESS)
             else:
-                # Keep error visible for 3 seconds before resetting
                 def _delayed_reset():
                     time.sleep(3)
                     self._set_voice_status("Ready", Palette.SUCCESS)
                     self._set_engine_status("Idle", Palette.SUCCESS)
                 threading.Thread(target=_delayed_reset, daemon=True).start()
 
-            self.root.after(0, self.btn_listen.config, {"state": tk.NORMAL})
+            self.root.after(0, self.btn_listen.config, {
+                "state": tk.NORMAL,
+                "text": "🎤  Run Voice Cycle",
+                "bg": Palette.ACCENT_DIM
+            })
             self._log("── Cycle complete ──")
 
     # ══════════════════════════════════════════════════════════════════════
