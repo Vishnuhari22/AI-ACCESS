@@ -830,6 +830,77 @@ Would you like me to help you complete this transaction?'"""
         return None
 
 
+AGENT_PROMPT = """You are the UIAA Accessibility Agent.
+You operate in a continuous loop to complete the user's ultimate goal on ANY application or website.
+Given the current screenshot, the user's goal, and the history of actions you just took, 
+decide the SINGLE next best action to take.
+
+JSON Schema:
+{
+    "form_analysis": {
+        "identified_fields": ["List of all interactive fields relevant to the task currently on screen"],
+        "user_provided_values": ["Fields the user explicitly provided values for in their goal"],
+        "missing_or_default_values": ["Fields that are empty, or have system default values that the user didn't explicitly authorize"]
+    },
+    "thought_process": "Explain your reasoning based on the screen, form_analysis, and history.",
+    "action_type": "CLICK | TYPE | SCROLL_DOWN | SCROLL_UP | DONE | ERROR | ASK_USER | READ_OPTIONS",
+    "target_name": "Short descriptive name of the element you are targeting (if clicking/typing).",
+    "target_box_2d": [ymin, xmin, ymax, xmax], 
+    "type_text": "Text to type if action_type is TYPE, otherwise null",
+    "press_keys": ["enter", "tab", "escape"] or null,
+    "speech_to_user": "What to narrate or ask the user (e.g., questions, reading options).",
+    "error_reason": "If action_type is ERROR, explain why."
+}
+
+Rules:
+- You must output exactly ONE action per turn.
+- **LOGICAL CONSISTENCY CHECK**: If the user's instructions contain contradictions (e.g., they asked for a "One-Way" trip but provided a "Return Date"), DO NOT silently override their choices or get confused. Use "ASK_USER" to gently point out the contradiction and ask how they want to resolve it (e.g., "You asked for a one-way trip but gave a return date. Should I switch to round-trip?").
+- **UPFRONT PLANNING & MISSING INFO**: When you first analyze a form, look at your `form_analysis`. If there are standard required fields for the task (like travel dates, passenger count, ticket class) that the user did not specify in their goal, DO NOT start clicking or typing yet. Immediately return "ASK_USER" to collect ALL missing requirements upfront in a single question (e.g., "I will set that up. What date are you traveling, and in what class?"). DO NOT ask about fields already in `user_provided_values`.
+- **READ_OPTIONS**: If a dropdown or list of choices is currently open on screen for a field the user specified (like "Chennai") and the exact choice is ambiguous, return "READ_OPTIONS". Use "speech_to_user" to read out the top 3 visible choices so they can pick (e.g., "For Chennai, I see: 1. Airport, 2. Station. Which one?").
+- If the goal is fully achieved, return "DONE".
+- If you are stuck, return "ERROR".
+- TYPE actions will automatically clear the field before typing. You MUST provide target_box_2d for TYPE actions so the system can click the field first.
+- box_2d is [ymin, xmin, ymax, xmax] on a 1000x1000 grid of the FULL screen.
+- Place coordinates precisely in the CENTER of the target.
+- For dropdowns: First CLICK the dropdown. On the next turn, you will see the options. If the choice is obvious, CLICK it. If ambiguous, use READ_OPTIONS.
+"""
+
+def analyze_agent_step(screenshot: Image.Image, goal: str, history: list) -> dict | None:
+    """Stateful agent loop analyzer for single-step continuous execution."""
+    if _client is None:
+        return None
+
+    buf = io.BytesIO()
+    screenshot.save(buf, format="PNG")
+    image_bytes = buf.getvalue()
+
+    history_str = "\n".join([f"- {h}" for h in history]) if history else "None yet."
+    
+    prompt = f"{AGENT_PROMPT}\n\nUltimate Goal: {goal}\n\nAction History:\n{history_str}\n\nDetermine the SINGLE next action."
+
+    contents = [
+        prompt,
+        types.Part.from_bytes(data=image_bytes, mime_type="image/png"),
+    ]
+
+    try:
+        # Use primary model (Gemini 1.5/2.5 Pro/Flash depending on config)
+        model = _MODEL_PRIORITY[0] if isinstance(_MODEL_PRIORITY, list) else "gemini-2.5-pro"
+        
+        response = _client.models.generate_content(
+            model=model, contents=contents,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.1, max_output_tokens=2048,
+            ),
+        )
+        text = _strip_markdown_fences(response.text.strip())
+        return json.loads(text)
+    except Exception as e:
+        print(f"[ScreenReader] Agent Step error: {e}")
+        return None
+
+
 if __name__ == "__main__":
     print("Testing Screen Reader...")
     img, mon = capture_screen()

@@ -24,7 +24,7 @@ import winsound
 
 from screen_reader import (capture_screen, analyze_screen_and_intent,
                           analyze_follow_up, verify_anchor, analyze_proactive, analyze_dropdown_options,
-                          wait_for_stable_screen, get_gemini_client)
+                          wait_for_stable_screen, get_gemini_client, analyze_agent_step)
 from overlay_voice import OverlayVoice
 from overlay_vision import OverlayVision
 from overlay_adapter import inject_click, inject_text, inject_keys, inject_scroll
@@ -249,6 +249,30 @@ class OverlayApp:
             command=self.run_cycle_async
         )
         self.btn_listen.pack(fill=tk.X, padx=12, pady=6)
+
+        # ④(b) Agent Loop Text Input & Button
+        self.agent_frame = tk.Frame(root, bg=Palette.BG)
+        self.agent_frame.pack(fill=tk.X, padx=12, pady=(0, 6))
+        
+        self.agent_input = tk.Entry(
+            self.agent_frame, font=self._fonts["indicator"], 
+            bg=Palette.BG_INPUT, fg=Palette.TEXT, insertbackground=Palette.TEXT
+        )
+        self.agent_input.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6), ipady=4)
+        
+        # Safe focus to help with Windows topmost issues without breaking internal events
+        self.agent_input.bind("<Button-1>", lambda e: self.agent_input.focus_set())
+        self.agent_input.bind("<Return>", lambda e: self.run_agent_cycle_async())
+        
+        self.btn_agent = tk.Button(
+            self.agent_frame, text="🤖 Run Agent",
+            font=self._fonts["keypad"],
+            bg="#5e35b1", fg="white", activebackground="#4527a0",
+            relief=tk.FLAT, padx=10, pady=4, cursor="hand2",
+            command=self.run_agent_cycle_async
+        )
+        self.btn_agent.pack(side=tk.RIGHT)
+
 
         # ⑤ Voice Transcript
         self.transcript_frame = tk.Frame(root, bg=Palette.BG)
@@ -1346,6 +1370,191 @@ class OverlayApp:
 
             self.root.after(0, self.btn_listen.config, {"state": tk.NORMAL})
             self._log("── Cycle complete ──")
+
+    # ══════════════════════════════════════════════════════════════════════
+    # Stateful Agent Loop (Phase 1 Upgrade)
+    # ══════════════════════════════════════════════════════════════════════
+    def run_agent_cycle_async(self):
+        """Dispatches the stateful agent loop to a background thread."""
+        self.root.after(0, self.btn_agent.config, {"state": tk.DISABLED})
+        self.root.after(0, self.btn_listen.config, {"state": tk.DISABLED})
+        threading.Thread(target=self.run_agent_cycle, daemon=True).start()
+
+    def run_agent_cycle(self):
+        self._cycle_had_error = False
+        self._last_cycle_time = time.time()
+        if hasattr(self, '_proactive'):
+            self._proactive.record_cycle()
+            
+        typed_goal = self.agent_input.get().strip()
+        if typed_goal:
+            user_goal = typed_goal
+            self.agent_input.delete(0, tk.END)
+            self._log(f"📝 Text input used: {user_goal}")
+            self._set_voice_status("Text Input ✓", Palette.SUCCESS)
+        else:
+            self._set_voice_status("Listening…", Palette.WARNING)
+            user_goal, err = self._listen_for_reply(timeout=10)
+            
+            if not user_goal:
+                error_msg = err or "No speech detected"
+                self._set_voice_status(f"⚠ {error_msg}", Palette.WARNING)
+                self._set_engine_status("Idle", Palette.SUCCESS)
+                self._log(f"⚠ Agent Loop aborted: {error_msg}")
+                self._play_error_sound()
+                self.root.after(0, self.btn_agent.config, {"state": tk.NORMAL})
+                self.root.after(0, self.btn_listen.config, {"state": tk.NORMAL})
+                return
+            
+            self._set_voice_status("Transcribed ✓", Palette.SUCCESS)
+            
+        self._set_transcript(f"Goal: {user_goal}")
+        self._log(f"🤖 Starting Agent Loop for Goal: '{user_goal}'")
+        self.voice.speak(f"Okay, working on: {user_goal}")
+        
+        history = []
+        max_steps = 30
+        step = 0
+        
+        while step < max_steps:
+            step += 1
+            if hasattr(self, '_proactive'):
+                self._proactive.record_cycle()
+                
+            self._log(f"--- Agent Step {step} ---")
+            self._set_engine_status(f"Step {step}: Capturing…", Palette.WARNING)
+            
+            wait_for_stable_screen(timeout=2.0, interval=0.25)
+            screenshot, monitor_info = capture_screen(hide_window=self.root)
+            
+            self._set_engine_status(f"Step {step}: Analysing…", Palette.WARNING)
+            action_data = analyze_agent_step(screenshot, user_goal, history)
+            
+            if not action_data:
+                self._log("Agent failed to respond. Aborting loop.")
+                self.voice.speak("I encountered an error planning the next step.")
+                break
+                
+            action_type = action_data.get("action_type")
+            thought = action_data.get("thought_process")
+            speech = action_data.get("speech_to_user")
+            
+            self._log(f"🤔 Thought: {thought}")
+            if speech:
+                self.voice.speak(speech)
+                
+            if action_type == "DONE":
+                self._log("✅ Goal Achieved!")
+                self._play_success_sound()
+                break
+            elif action_type == "ERROR":
+                self._log(f"❌ Agent Error: {action_data.get('error_reason')}")
+                self._play_error_sound()
+                break
+            elif action_type in ["ASK_USER", "READ_OPTIONS"]:
+                if action_type == "READ_OPTIONS":
+                    self._log(f"📖 Agent reading options: {speech}")
+                else:
+                    self._log(f"❓ Agent asked: {speech}")
+                
+                # Thread-safe dialog using an Event
+                ans_container = []
+                ev = threading.Event()
+                def _ask():
+                    # Custom dialog to guarantee it appears on top and doesn't freeze invisibly
+                    dlg = tk.Toplevel(self.root)
+                    dlg.title("Agent Needs Info")
+                    dlg.attributes("-topmost", True)
+                    # Auto-size height based on text length by omitting the height parameter
+                    dlg.geometry(f"300x250+{self.root.winfo_x() - 50}+{self.root.winfo_y() + 100}")
+                    dlg.configure(bg=Palette.BG_CARD)
+                    
+                    tk.Label(dlg, text=speech, font=self._fonts["status"], bg=Palette.BG_CARD, fg=Palette.TEXT, wraplength=280).pack(pady=10)
+                    ans_entry = tk.Entry(dlg, font=self._fonts["indicator"], bg=Palette.BG_INPUT, fg=Palette.TEXT, insertbackground=Palette.TEXT)
+                    ans_entry.pack(fill=tk.X, padx=15, pady=5)
+                    ans_entry.focus_set()
+                    
+                    def _on_submit(*args):
+                        ans_container.append(ans_entry.get().strip())
+                        dlg.destroy()
+                        ev.set()
+                        
+                    ans_entry.bind("<Return>", _on_submit)
+                    tk.Button(dlg, text="Submit", command=_on_submit, bg=Palette.ACCENT_DIM, fg="white", relief=tk.FLAT).pack(pady=10)
+                    
+                    # If user closes window with X
+                    def _on_close():
+                        ans_container.append(None)
+                        dlg.destroy()
+                        ev.set()
+                    dlg.protocol("WM_DELETE_WINDOW", _on_close)
+
+                self.root.after(0, _ask)
+                ev.wait()
+                
+                user_reply = ans_container[0] if ans_container else None
+                if user_reply:
+                    user_goal = f"{user_goal}. [User clarified: {user_reply}]"
+                    self._log(f"📝 Goal updated to: {user_goal}")
+                    self._set_transcript(f"Goal: {user_goal}")
+                    history.append(f"Turn {step}: Asked user '{speech}', user replied '{user_reply}'")
+                else:
+                    self._log("❌ User cancelled the clarification dialog. Aborting loop.")
+                    break
+                continue # Restart loop with new goal
+                
+            self._set_engine_status(f"Step {step}: Executing {action_type}…", Palette.WARNING)
+            
+            box = action_data.get("target_box_2d")
+            if box and (len(box) == 4 or len(box) == 2):
+                if len(box) == 4:
+                    ymin, xmin, ymax, xmax = [float(v) for v in box]
+                    center_x = ((xmin + xmax) / 2) / 1000.0
+                    center_y = ((ymin + ymax) / 2) / 1000.0
+                elif len(box) == 2:
+                    center_y = float(box[0]) / 1000.0
+                    center_x = float(box[1]) / 1000.0
+                else:
+                    continue
+                
+                if action_type in ["CLICK", "TYPE"]:
+                    self._log(f"🖱️ Clicking at ({center_x:.2f}, {center_y:.2f})")
+                    inject_click(center_x, center_y, monitor_info, self.root)
+                    
+                if action_type == "TYPE":
+                    type_text = action_data.get("type_text")
+                    if type_text:
+                        self._log(f"⌨️ Typing: '{type_text}'")
+                        inject_text(type_text)
+                        
+            elif action_type == "SCROLL_DOWN":
+                inject_scroll("down")
+            elif action_type == "SCROLL_UP":
+                inject_scroll("up")
+                
+            keys_to_press = action_data.get("press_keys")
+            if keys_to_press and isinstance(keys_to_press, list):
+                inject_keys(keys_to_press)
+                
+            # Build detailed history string
+            hist_str = f"Turn {step}: {action_type}"
+            if action_type == "TYPE" and action_data.get("type_text"):
+                hist_str += f" '{action_data['type_text']}' into {action_data.get('target_name', 'field')}"
+            elif action_type == "CLICK":
+                hist_str += f" on {action_data.get('target_name', 'element')}"
+            if keys_to_press:
+                hist_str += f", then pressed {keys_to_press}"
+            history.append(hist_str)
+            time.sleep(1.0)
+            
+        if step >= max_steps:
+            self._log("⚠ Max steps reached. Aborting to prevent infinite loop.")
+            self.voice.speak("I've reached the maximum number of steps for this task.")
+            
+        self._set_engine_status("Idle", Palette.SUCCESS)
+        self.root.after(0, self.btn_agent.config, {"state": tk.NORMAL})
+        self.root.after(0, self.btn_listen.config, {"state": tk.NORMAL})
+        self._log("── Agent Cycle Complete ──")
 
     # ══════════════════════════════════════════════════════════════════════
     # Shutdown

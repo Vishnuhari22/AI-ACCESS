@@ -73,8 +73,16 @@ def inject_text(text: str):
     # Brief pause to let the target field fully gain focus after a click
     time.sleep(0.25)
 
+    # Some fields require a double click to focus properly
+    pyautogui.click()
+    time.sleep(0.1)
+
     # Select all existing text first so new text replaces it (prevents appending)
     pyautogui.hotkey('ctrl', 'a')
+    time.sleep(0.05)
+    
+    # Explicitly press backspace to erase it (in case typing doesn't overwrite)
+    pyautogui.press('backspace')
     time.sleep(0.05)
 
     # Check if text is pure ASCII — pyautogui.write() only handles ASCII
