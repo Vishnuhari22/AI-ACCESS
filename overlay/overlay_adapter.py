@@ -6,10 +6,11 @@ import pyautogui
 pyautogui.FAILSAFE = True
 
 
-def inject_click(normalized_x: float, normalized_y: float, monitor_info: dict, overlay_window=None):
+def inject_click(normalized_x: float, normalized_y: float, monitor_info: dict, overlay_window=None, restore_overlay: bool = True) -> bool:
     """
     Uses pyautogui to inject a real OS-level mouse click, bypassing kiosk APIs.
     Checks if click would hit the overlay window and momentarily hides it if occluded.
+    Returns True if overlay was hidden for the click.
     """
     screen_width  = monitor_info['width']
     screen_height = monitor_info['height']
@@ -34,7 +35,7 @@ def inject_click(normalized_x: float, normalized_y: float, monitor_info: dict, o
                 if (wx <= target_x <= wx + ww) and (wy <= target_y <= wy + wh):
                     print(f"[Adapter] ⚠️ Target ({target_x}, {target_y}) is under overlay! Briefly withdrawing...")
                     overlay_window.withdraw()
-                    overlay_window.update()
+                    overlay_window.update() #Immediately process the withdrawal without any delay
                     was_hidden = True
                     time.sleep(0.15)
         except Exception as e:
@@ -49,7 +50,7 @@ def inject_click(normalized_x: float, normalized_y: float, monitor_info: dict, o
     time.sleep(0.05)
     pyautogui.mouseUp()
     
-    if was_hidden and overlay_window:
+    if was_hidden and overlay_window and restore_overlay:
         try:
             print("[Adapter] Restoring overlay...")
             overlay_window.deiconify()
@@ -58,34 +59,31 @@ def inject_click(normalized_x: float, normalized_y: float, monitor_info: dict, o
         except Exception:
             pass
 
+    return was_hidden
 
-def inject_text(text: str):
+
+def inject_text(text: str, overlay_window=None, press_enter: bool = False):
     """
     Types text into the currently focused input field using OS-level keystrokes.
-
-    Args:
-        text: The string to type. Only ASCII-safe characters are typed directly;
-              for Unicode text (e.g. non-Latin scripts), clipboard paste is used.
+    Safely clears input without global Ctrl+A webpage selection if unfocused.
+    If press_enter is True, presses Enter after typing.
+    Defaults to False so autocomplete suggestions and dropdowns stay open for observation.
     """
     if not text:
         return
 
-    # Brief pause to let the target field fully gain focus after a click
-    time.sleep(0.25)
+    # Let the clicked target field settle and register OS focus
+    time.sleep(0.15)
 
-    # Some fields require a double click to focus properly
-    pyautogui.click()
-    time.sleep(0.1)
-
-    # Select all existing text first so new text replaces it (prevents appending)
+    # In modern travel sites (like ixigo, IRCTC), clicking a place field opens the search input or clears it.
+    # We clear the field by selecting or backspacing gently:
+    # First select field content, backspace, then type
     pyautogui.hotkey('ctrl', 'a')
-    time.sleep(0.05)
-    
-    # Explicitly press backspace to erase it (in case typing doesn't overwrite)
+    time.sleep(0.04)
     pyautogui.press('backspace')
-    time.sleep(0.05)
+    time.sleep(0.04)
 
-    # Check if text is pure ASCII — pyautogui.write() only handles ASCII
+    # Check if text is pure ASCII
     try:
         text.encode('ascii')
         is_ascii = True
@@ -93,17 +91,20 @@ def inject_text(text: str):
         is_ascii = False
 
     if is_ascii:
-        # Type character-by-character with a small interval for reliability
         print(f"[Adapter] Typing text: '{text}'")
         pyautogui.write(text, interval=0.03)
     else:
-        # For Unicode text, use clipboard paste (Ctrl+V)
         import subprocess
         print(f"[Adapter] Pasting text (non-ASCII): '{text}'")
         subprocess.run(['clip'], input=text.encode('utf-16-le'), check=True,
-                       creationflags=0x08000000)  # CREATE_NO_WINDOW
-        time.sleep(0.1)
+                       creationflags=0x08000000)
+        time.sleep(0.08)
         pyautogui.hotkey('ctrl', 'v')
+
+    time.sleep(0.15)
+    if press_enter:
+        print("[Adapter] Pressing enter to commit text")
+        pyautogui.press('enter')
 
 
 def inject_keys(keys: list):

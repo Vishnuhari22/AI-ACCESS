@@ -4,3 +4,9 @@ google-generativeai>=0.8.0
 python-dotenv==1.0.1
 jsonschema==4.21.1
 websockets==12.0
+
+# Added for Web Agent PoC (Phase 1)
+browser-use
+playwright
+langchain-google-genai
+python-dotenv

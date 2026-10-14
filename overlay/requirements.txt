@@ -11,6 +11,8 @@ pyttsx3>=2.90
 pywin32>=306          # Required by pyttsx3 SAPI5 driver on Windows
 SpeechRecognition>=3.10.0
 pyaudio>=0.2.14
+faster-whisper>=1.0.0 # High-accuracy local speech recognition
+av>=11.0.0,<14.0.0    # Audio container decoder
 
 # Gemini AI + OpenAI fallback + environment
 google-genai>=1.0.0           # New official Gemini SDK (replaces google-generativeai)

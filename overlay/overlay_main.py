@@ -22,6 +22,9 @@ import time
 from datetime import datetime
 import winsound
 
+import qrcode
+from PIL import Image, ImageTk
+
 from screen_reader import (capture_screen, analyze_screen_and_intent,
                           analyze_follow_up, verify_anchor, analyze_proactive, analyze_dropdown_options,
                           wait_for_stable_screen, get_gemini_client, analyze_agent_step)
@@ -30,6 +33,7 @@ from overlay_vision import OverlayVision
 from overlay_adapter import inject_click, inject_text, inject_keys, inject_scroll
 from proactive_monitor import ProactiveMonitor
 from escalation import EscalationManager, EscalationState
+from overlay_companion import CompanionServer
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -69,6 +73,75 @@ class AdaptationLevel:
     VISUAL  = "visual"      # squinting detected → high-contrast + large fonts
     MOTOR   = "motor"       # leaning forward → larger buttons + more spacing
     FULL    = "full"        # both detected → max adaptation
+
+
+TOGGLE_KEYWORDS = [
+    "one way", "round trip", "multi city", "special fares", "defence forces", 
+    "senior citizen", "student", "unaccompanied minor", "economy", "business", "first class"
+]
+
+def classify_targets(targets: list) -> dict:
+    """Classifies screen targets into inputs, dropdowns, toggle groups, and buttons.
+
+    Shared helper used by both desktop virtual keypad and mobile companion API.
+    """
+    inputs = []
+    dropdowns = []
+    toggle_groups = {}
+    buttons = []
+    grid_items = []
+
+    for t in (targets or []):
+        name = t.get("name", "").strip()
+        btype = t.get("type", "button").lower()
+        nl = name.lower()
+
+        if btype == "input":
+            inputs.append({
+                "name": name,
+                "type": "input",
+                "current_value": t.get("current_value", ""),
+                "box_2d": t.get("box_2d")
+            })
+            grid_items.append(("input_or_dropdown", t))
+        elif btype == "dropdown":
+            opts = t.get("options") or ["Select option"]
+            dropdowns.append({
+                "name": name,
+                "type": "dropdown",
+                "options": opts,
+                "current_value": t.get("current_value", opts[0] if opts else ""),
+                "box_2d": t.get("box_2d")
+            })
+            grid_items.append(("input_or_dropdown", t))
+        elif any(kw in nl for kw in TOGGLE_KEYWORDS):
+            if any(x in nl for x in ["one way", "round trip", "multi city"]):
+                group_key = "Trip Type"
+            elif any(x in nl for x in ["economy", "business", "first class"]):
+                group_key = "Cabin Class"
+            else:
+                group_key = "Option Selection"
+
+            if group_key not in toggle_groups:
+                toggle_groups[group_key] = []
+            if name not in toggle_groups[group_key]:
+                toggle_groups[group_key].append(name)
+            grid_items.append(("toggle", t))
+        else:
+            buttons.append({
+                "name": name,
+                "type": btype,
+                "box_2d": t.get("box_2d")
+            })
+            grid_items.append(("button", t))
+
+    return {
+        "inputs": inputs,
+        "dropdowns": dropdowns,
+        "toggle_groups": toggle_groups,
+        "buttons": buttons,
+        "grid_items": grid_items
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -131,7 +204,17 @@ class OverlayApp:
         self._last_face_time = time.time()
         self._dock_left = False
         self._is_seated = False
+        self._companion_force_show = True  # Testing flag: shows QR companion even if camera is off
+        self._is_fullscreen = False
         self._conversation_context = []
+        self._is_busy = False
+        self._busy_lock = threading.Lock()
+        self._is_processing = False
+        self._pending_question = None
+        self._agent_step_status = ""
+        self._companion_qr_visible = False
+        self._companion_qr_img = None
+        self._companion_server = None
 
 
         # --- Fonts (will be reconfigured on adaptation) ---
@@ -162,7 +245,13 @@ class OverlayApp:
             font=self._fonts["title"], fg=Palette.ACCENT, bg=Palette.BG, anchor="w"
         )
         self.title_lbl.pack(side=tk.LEFT)
-        
+        self.fullscreen_btn = tk.Button(
+            self.header_frame, text="⛶ Fullscreen Facade", font=self._fonts["indicator"],
+            bg=Palette.ACCENT_DIM, fg="white", relief=tk.FLAT,
+            command=self._toggle_fullscreen_mode, padx=6, pady=2, cursor="hand2"
+        )
+        self.fullscreen_btn.pack(side=tk.RIGHT, padx=4)
+
         self.dock_btn = tk.Button(
             self.header_frame, text="⇄ Dock", font=self._fonts["indicator"],
             bg=Palette.KEYPAD_BTN, fg=Palette.TEXT_DIM, relief=tk.FLAT,
@@ -220,10 +309,10 @@ class OverlayApp:
         )
         self.adapt_lbl.pack(side=tk.LEFT)
 
-        # Wake word toggle
-        self._wake_word_enabled = tk.BooleanVar(value=False)
+        # Wake word toggle (enabled by default for hands-free blind access)
+        self._wake_word_enabled = tk.BooleanVar(value=True)
         self.wake_cb = tk.Checkbutton(
-            root, text="Wake Word ('access')", variable=self._wake_word_enabled,
+            root, text="Access Word ('access' / 'hey access')", variable=self._wake_word_enabled,
             font=self._fonts["indicator"], bg=Palette.BG, fg=Palette.TEXT_DIM,
             selectcolor=Palette.BG, activebackground=Palette.BG,
             command=self._toggle_wake_word
@@ -238,17 +327,49 @@ class OverlayApp:
             font=self._fonts["indicator"], bg=Palette.BG, fg=Palette.TEXT_DIM,
             selectcolor=Palette.BG, activebackground=Palette.BG
         )
-        self.guide_cb.pack(fill=tk.X, padx=12, pady=(0, 4))
+        self.guide_cb.pack(fill=tk.X, padx=12, pady=(0, 2))
 
-        # ④ Voice Cycle Button
+        # ③(b) Wheelchair Mobile Companion Banner (Shows QR Code when seated/wheelchair detected)
+        self.companion_frame = tk.Frame(root, bg=Palette.BG_CARD, highlightbackground="#0288d1", highlightthickness=1)
+        self.companion_lbl_qr = tk.Label(self.companion_frame, bg=Palette.BG_CARD)
+        self.companion_lbl_qr.pack(side=tk.LEFT, padx=8, pady=6)
+        
+        comp_text_frame = tk.Frame(self.companion_frame, bg=Palette.BG_CARD)
+        comp_text_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4, pady=6)
+        tk.Label(
+            comp_text_frame, text="♿ Wheelchair Mobile Companion",
+            font=self._fonts["section"], fg="#00e5ff", bg=Palette.BG_CARD, anchor="w"
+        ).pack(fill=tk.X)
+        self.companion_url_lbl = tk.Label(
+            comp_text_frame, text="Scan with phone camera to control from your lap",
+            font=self._fonts["indicator"], fg=Palette.TEXT, bg=Palette.BG_CARD, anchor="w", wraplength=260, justify=tk.LEFT
+        )
+        self.companion_url_lbl.pack(fill=tk.X, pady=(2, 0))
+
+        # Start background companion HTTP server
+        self._init_companion_server()
+
+        # ④ Action Buttons Frame
+        self.action_btn_frame = tk.Frame(root, bg=Palette.BG)
+        self.action_btn_frame.pack(fill=tk.X, padx=12, pady=6)
+
+        self.btn_scan = tk.Button(
+            self.action_btn_frame, text="🔍 Scan Screen",
+            font=self._fonts["keypad"],
+            bg="#0077b6", fg="white", activebackground="#023e8a",
+            relief=tk.FLAT, padx=10, pady=7, cursor="hand2",
+            command=lambda: self.run_cycle_async(pre_transcribed_text="Scan all fields on this screen.")
+        )
+        self.btn_scan.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+
         self.btn_listen = tk.Button(
-            root, text="🎤  Run Voice Cycle",
+            self.action_btn_frame, text="🎤 Voice Cycle",
             font=self._fonts["keypad"],
             bg=Palette.ACCENT_DIM, fg="white", activebackground="#023e8a",
-            relief=tk.FLAT, padx=14, pady=7, cursor="hand2",
+            relief=tk.FLAT, padx=10, pady=7, cursor="hand2",
             command=self.run_cycle_async
         )
-        self.btn_listen.pack(fill=tk.X, padx=12, pady=6)
+        self.btn_listen.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(4, 0))
 
         # ④(b) Agent Loop Text Input & Button
         self.agent_frame = tk.Frame(root, bg=Palette.BG)
@@ -331,21 +452,31 @@ class OverlayApp:
         self.keypad_canvas.bind("<MouseWheel>",
             lambda e: self.keypad_canvas.yview_scroll(int(-1*(e.delta/120)), "units"))
 
-        # ⑧ Activity Log
+        # ⑧ Activity Log (Collapsible to keep all focus on simplified cards)
         tk.Frame(root, bg=Palette.BORDER, height=1).pack(fill=tk.X, padx=12, pady=(4, 2))
-        log_header = tk.Frame(root, bg=Palette.BG)
-        log_header.pack(fill=tk.X, padx=12)
-        tk.Label(log_header, text="▸ Pipeline Log",
+        self.log_header = tk.Frame(root, bg=Palette.BG)
+        self.log_header.pack(fill=tk.X, padx=12)
+        tk.Label(self.log_header, text="▸ Pipeline Log",
                  font=self._fonts["section"], fg=Palette.TEXT_DIM, bg=Palette.BG,
                  anchor="w").pack(side=tk.LEFT)
 
+        self._log_expanded = tk.BooleanVar(value=False)
+        self.btn_toggle_log = tk.Button(
+            self.log_header, text="Show Log ▾", font=self._fonts["indicator"],
+            bg=Palette.KEYPAD_BTN, fg=Palette.TEXT_DIM, relief=tk.FLAT,
+            padx=4, pady=1, cursor="hand2", command=self._toggle_log_view
+        )
+        self.btn_toggle_log.pack(side=tk.RIGHT)
+
+        self.log_container = tk.Frame(root, bg=Palette.BG)
         self.log_text = tk.Text(
-            root, height=8, bg=Palette.BG_INPUT, fg=Palette.TEXT_DIM,
+            self.log_container, height=4, bg=Palette.BG_INPUT, fg=Palette.TEXT_DIM,
             font=self._fonts["log"], relief=tk.FLAT, wrap=tk.WORD,
             padx=8, pady=4, state=tk.DISABLED, cursor="arrow",
             insertbackground=Palette.TEXT_DIM
         )
         self.log_text.pack(fill=tk.BOTH, expand=True, padx=12, pady=(2, 4))
+        # Keep log collapsed by default so user immediately sees all website fields!
 
         # ⑨ Demo/Live Toggle
         self.controls_frame = tk.Frame(root, bg=Palette.BG)
@@ -404,6 +535,11 @@ class OverlayApp:
         self._proactive.start()
 
         self._log("System initialized. Ready.")
+        # Auto-start hands-free access word listener for blind accessibility
+        self.root.after(1200, self._auto_start_wake_word)
+
+        # Automatically scan the current screen upon launch to populate the facade immediately
+        self.root.after(3500, lambda: self.run_cycle_async(pre_transcribed_text="Scan all fields on this screen."))
 
     # ══════════════════════════════════════════════════════════════════════
     # Font Management
@@ -443,15 +579,67 @@ class OverlayApp:
             return AdaptationLevel.NORMAL
 
     def _toggle_dock(self):
+        if self._is_fullscreen:
+            return  # Dock toggle is only for side panel mode
         self._dock_left = not self._dock_left
         self._update_window_geometry()
 
+    def _toggle_fullscreen_mode(self):
+        """Toggles between compact side-panel and full-screen simplified facade mode."""
+        self._is_fullscreen = not self._is_fullscreen
+        if self._is_fullscreen:
+            self.fullscreen_btn.config(text="❐ Docked Panel", bg="#388e3c")
+            self._log("⛶ Switched to Full-Screen Simplified Facade Mode")
+        else:
+            self.fullscreen_btn.config(text="⛶ Fullscreen Facade", bg=Palette.ACCENT_DIM)
+            self._log("❐ Switched to Docked Side-Panel Mode")
+        self._update_window_geometry()
+        # Rebuild keypad / facade with current targets
+        if hasattr(self, '_current_targets') and hasattr(self, 'monitor_info'):
+            self._rebuild_keypad(self._current_targets, self.monitor_info)
+
+    def _toggle_log_view(self):
+        """Shows or hides the technical pipeline log to keep focus on web elements."""
+        is_exp = not self._log_expanded.get()
+        self._log_expanded.set(is_exp)
+        if is_exp:
+            self.btn_toggle_log.config(text="Hide Log ▴")
+            self.log_container.pack(fill=tk.BOTH, expand=False, padx=12, pady=(2, 4))
+        else:
+            self.btn_toggle_log.config(text="Show Log ▾")
+            self.log_container.pack_forget()
+        self._update_window_geometry()
+
     def _update_window_geometry(self):
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+
+        # Wheelchair Companion QR: show when seated (wheelchair stance) or during testing
+        if hasattr(self, 'companion_frame'):
+            should_show_companion = getattr(self, '_companion_force_show', False) or self._is_seated
+            if should_show_companion:
+                if not self._companion_qr_visible:
+                    # Place right under guide_cb
+                    self.companion_frame.pack(fill=tk.X, padx=12, pady=(2, 6), before=self.action_btn_frame)
+                    self._companion_qr_visible = True
+                    self._update_companion_qr()
+            else:
+                if self._companion_qr_visible:
+                    self.companion_frame.pack_forget()
+                    self._companion_qr_visible = False
+
+        if self._is_fullscreen:
+            # Expand overlay to cover the full screen
+            self.root.geometry(f"{screen_w}x{screen_h}+0+0")
+            if hasattr(self, 'keypad_outer'):
+                # Keypad gets almost the entire monitor in fullscreen mode
+                avail_h = screen_h - (280 if self._log_expanded.get() else 180)
+                self.keypad_outer.config(height=max(450, avail_h))
+            return
+
         scale = self._FONT_SCALE[self._adaptation_level]
         new_w = int(self._base_width * scale)
         new_h = int(self._base_height * scale)
-        screen_w = self.root.winfo_screenwidth()
-        screen_h = self.root.winfo_screenheight()
         
         # X Position: dock left vs right
         if self._dock_left:
@@ -466,6 +654,9 @@ class OverlayApp:
             y_pos = 30
             
         self.root.geometry(f"{new_w}x{new_h}+{x_pos}+{y_pos}")
+        if hasattr(self, 'keypad_outer'):
+            # In side panel mode, keypad gets generous height (260px) when log is collapsed
+            self.keypad_outer.config(height=180 if self._log_expanded.get() else 260)
 
     def _apply_adaptation(self, level: str):
         """Apply full UI adaptation based on the detected level.
@@ -785,15 +976,8 @@ class OverlayApp:
         self.root.after(0, _show)
 
     def _set_description(self, text: str):
-        def _show():
-            self._desc_var.set(text)
-            if text and not self._desc_visible:
-                self.desc_lbl.pack(fill=tk.X, pady=(0, 2))
-                self._desc_visible = True
-            elif not text and self._desc_visible:
-                self.desc_lbl.pack_forget()
-                self._desc_visible = False
-        self.root.after(0, _show)
+        # Yellow screen description text is suppressed as requested to keep UI clean
+        self._desc_var.set(text)
 
     def _show_sensitive_on_screen(self, text: str):
         """Display sensitive data visually (no TTS) with auto-hide."""
@@ -902,74 +1086,463 @@ class OverlayApp:
             "button": "🔘",
             "link":   "🔗",
             "input":  "📝",
+            "dropdown": "▾",
             "text":   "📄",
         }
 
-        for idx, t in enumerate(targets, 1):
+        # Full-screen mode uses 4 or 5 columns depending on screen width, docked uses 2 columns
+        screen_w = self.root.winfo_screenwidth()
+        if self._is_fullscreen:
+            num_cols = 5 if screen_w >= 1600 else 4
+        else:
+            num_cols = 2
+
+        # Configure equal column weight across all columns so cards stretch fully from left to right
+        for c in range(num_cols):
+            self.keypad_frame.grid_columnconfigure(c, weight=1)
+        card_bg = Palette.HC_BTN if is_hc else Palette.BG_CARD
+
+        # Store references to all form input variables and option toggles
+        self._overlay_form_vars = {}
+        # Keep track of toggle button widgets for dynamic visual state
+        toggle_button_widgets = {}
+
+        # Separate targets into: Form Inputs / Dropdowns, Toggle Options, and Action Buttons
+        classified = classify_targets(targets)
+        grid_items = classified["grid_items"]
+
+        for idx, (item_kind, t) in enumerate(grid_items, 1):
             btn_name = t.get("name", "Unknown")
-            btn_type = t.get("type", "button")
+            btn_type = t.get("type", "button").lower()
             icon = type_icons.get(btn_type, "🔘")
-
             circled_num = chr(0x245F + idx) if idx <= 20 else str(idx)
-            display_text = f"{circled_num} {icon}\n{btn_name}"
 
-            def make_click_handler(target_info, mon):
-                def handler():
-                    b = target_info.get("box_2d")
-                    if b and isinstance(b, list) and len(b) == 4:
-                        ymin, xmin, ymax, xmax = b
-                        nx = ((xmin + xmax) / 2) / 1000.0
-                        ny = ((ymin + ymax) / 2) / 1000.0
-                        self._log(f"Keypad click -> '{target_info.get('name')}' ({nx:.3f}, {ny:.3f})")
-                        inject_click(nx, ny, mon, self.root)
-                    else:
-                        self._log(f"❌ No coordinates for '{target_info.get('name')}'")
-                return handler
+            row = (idx - 1) // num_cols
+            col = (idx - 1) % num_cols
 
-            btn = tk.Button(
-                self.keypad_frame,
-                text=display_text,
-                font=self._fonts["keypad"],
-                bg=btn_bg, fg=btn_fg,
-                activebackground=Palette.ACCENT_DIM if not is_hc else Palette.HC_ACCENT,
-                activeforeground="white",
-                relief=tk.FLAT,
-                height=btn_height,
-                anchor="center",
-                justify="center",
-                padx=8, pady=btn_pady,
-                cursor="hand2",
-                highlightbackground=btn_border,
-                highlightthickness=1,
-                command=make_click_handler(t, monitor_info)
-            )
-            
-            # Grid layout: 2 columns
-            row = (idx - 1) // 2
-            col = (idx - 1) % 2
-            btn.grid(row=row, column=col, sticky="nsew", padx=4, pady=4)
+            def get_target_coords(target_info):
+                b = target_info.get("box_2d")
+                if b and isinstance(b, list) and len(b) == 4:
+                    ymin, xmin, ymax, xmax = b
+                    return ((xmin + xmax) / 2) / 1000.0, ((ymin + ymax) / 2) / 1000.0
+                return None, None
 
-        # Make columns equal width
-        self.keypad_frame.grid_columnconfigure(0, weight=1, uniform="col")
-        self.keypad_frame.grid_columnconfigure(1, weight=1, uniform="col")
+            # ─────────────────────────────────────────────────────────────
+            # (A) INPUT FIELDS (Text entry, Search, Location, Date)
+            # ─────────────────────────────────────────────────────────────
+            if item_kind == "input_or_dropdown" and btn_type == "input":
+                card = tk.Frame(
+                    self.keypad_frame, bg=card_bg, highlightbackground=btn_border,
+                    highlightthickness=1, padx=10, pady=8
+                )
+                card.grid(row=row, column=col, sticky="nsew", padx=6, pady=6)
 
-        # Update keypad title with count
-        self.keypad_title.config(text=f"▸ Virtual Accessibility Keypad  ({len(targets)} targets)")
+                lbl = tk.Label(
+                    card, text=f"{circled_num} 📝 {btn_name}",
+                    font=self._fonts["keypad"], fg=btn_fg, bg=card_bg, anchor="w", justify=tk.LEFT
+                )
+                lbl.pack(fill=tk.X, pady=(0, 4))
+
+                entry_var = tk.StringVar(value=t.get("current_value", ""))
+                self._overlay_form_vars[btn_name] = entry_var
+
+                entry = tk.Entry(
+                    card, textvariable=entry_var, font=self._fonts["keypad"],
+                    bg=Palette.BG_INPUT, fg=Palette.TEXT, insertbackground=Palette.TEXT,
+                    relief=tk.FLAT
+                )
+                entry.pack(fill=tk.X, pady=(2, 2), ipady=5)
+
+            # ─────────────────────────────────────────────────────────────
+            # (B) DROPDOWN / SELECT WIDGETS
+            # ─────────────────────────────────────────────────────────────
+            elif item_kind == "input_or_dropdown" and btn_type == "dropdown":
+                card = tk.Frame(
+                    self.keypad_frame, bg=card_bg, highlightbackground=btn_border,
+                    highlightthickness=1, padx=10, pady=8
+                )
+                card.grid(row=row, column=col, sticky="nsew", padx=6, pady=6)
+
+                lbl = tk.Label(
+                    card, text=f"{circled_num} ▾ {btn_name}",
+                    font=self._fonts["keypad"], fg=btn_fg, bg=card_bg, anchor="w", justify=tk.LEFT
+                )
+                lbl.pack(fill=tk.X, pady=(0, 4))
+
+                opts = t.get("options") or ["Select option"]
+                selected_opt = tk.StringVar(value=t.get("current_value", opts[0]))
+                self._overlay_form_vars[btn_name] = selected_opt
+
+                opt_menu = tk.OptionMenu(card, selected_opt, *opts)
+                opt_menu.config(
+                    font=self._fonts["indicator"], bg=Palette.BG_INPUT, fg=btn_fg,
+                    activebackground=Palette.ACCENT_DIM, relief=tk.FLAT, bd=0
+                )
+                opt_menu["menu"].config(font=self._fonts["indicator"])
+                opt_menu.pack(fill=tk.X, pady=(2, 2), ipady=3)
+
+            # ─────────────────────────────────────────────────────────────
+            # (C) TOGGLE / RADIO OPTIONS (e.g. One Way, Round Trip)
+            # ─────────────────────────────────────────────────────────────
+            elif item_kind == "toggle":
+                # Determine group: "Trip Type" for one way/round trip, else "Options"
+                nl = btn_name.lower()
+                if any(x in nl for x in ["one way", "round trip", "multi city"]):
+                    group_key = "Trip Type"
+                elif any(x in nl for x in ["economy", "business", "first class"]):
+                    group_key = "Cabin Class"
+                else:
+                    group_key = "Option Selection"
+
+                if group_key not in self._overlay_form_vars:
+                    # Default selection to current or empty
+                    self._overlay_form_vars[group_key] = tk.StringVar(value="")
+                    toggle_button_widgets[group_key] = []
+
+                group_var = self._overlay_form_vars[group_key]
+
+                def make_toggle_handler(g_key, opt_name):
+                    def handler():
+                        # Set active choice
+                        self._overlay_form_vars[g_key].set(opt_name)
+                        self._log(f"🔘 Selected {g_key}: '{opt_name}'")
+                        self.voice.play_earcon("listening")
+                        # Update all buttons in this toggle group
+                        for b_w, b_name in toggle_button_widgets.get(g_key, []):
+                            if b_name == opt_name:
+                                b_w.config(bg="#1565c0", fg="white", relief=tk.SUNKEN)
+                            else:
+                                b_w.config(bg=btn_bg, fg=btn_fg, relief=tk.FLAT)
+                    return handler
+
+                btn = tk.Button(
+                    self.keypad_frame,
+                    text=f"{circled_num} 🔘 {btn_name}",
+                    font=self._fonts["keypad"],
+                    bg=btn_bg, fg=btn_fg,
+                    activebackground=Palette.ACCENT_DIM if not is_hc else Palette.HC_ACCENT,
+                    activeforeground="white",
+                    relief=tk.FLAT,
+                    height=btn_height,
+                    anchor="center",
+                    justify="center",
+                    padx=8, pady=btn_pady,
+                    cursor="hand2",
+                    highlightbackground=btn_border,
+                    highlightthickness=1,
+                    command=make_toggle_handler(group_key, btn_name)
+                )
+                btn.grid(row=row, column=col, sticky="nsew", padx=6, pady=6)
+                toggle_button_widgets[group_key].append((btn, btn_name))
+
+            # ─────────────────────────────────────────────────────────────
+            # (D) DIRECT PAGE ACTIONS & LINKS (e.g. Search Flights, Login)
+            # ─────────────────────────────────────────────────────────────
+            else:
+                display_text = f"{circled_num} {icon}\n{btn_name}"
+                nl = btn_name.strip().lower()
+                is_search_or_submit_action = any(
+                    kw in nl for kw in ["search", "find", "book", "submit", "continue", "proceed"]
+                )
+
+                def make_click_handler(target_info, mon, is_submit_btn=False):
+                    def handler():
+                        if is_submit_btn:
+                            self._log(f"🚀 Triggering full submission via '{target_info.get('name')}'")
+                            execute_all_inputs_via_agent()
+                            return
+
+                        nx, ny = get_target_coords(target_info)
+                        if nx is not None and ny is not None:
+                            self._log(f"Clicked '{target_info.get('name')}' ({nx:.3f}, {ny:.3f})")
+                            inject_click(nx, ny, mon, self.root)
+                            self.voice.play_earcon("processing")
+                        else:
+                            self._log(f"❌ No coordinates for '{target_info.get('name')}'")
+                    return handler
+
+                btn = tk.Button(
+                    self.keypad_frame,
+                    text=display_text,
+                    font=self._fonts["keypad"],
+                    bg="#2e7d32" if is_search_or_submit_action else btn_bg,
+                    fg="white" if is_search_or_submit_action else btn_fg,
+                    activebackground="#1b5e20" if is_search_or_submit_action else (Palette.ACCENT_DIM if not is_hc else Palette.HC_ACCENT),
+                    activeforeground="white",
+                    relief=tk.FLAT,
+                    height=btn_height,
+                    anchor="center",
+                    justify="center",
+                    padx=8, pady=btn_pady,
+                    cursor="hand2",
+                    highlightbackground=btn_border,
+                    highlightthickness=1,
+                    command=make_click_handler(t, monitor_info, is_submit_btn=is_search_or_submit_action)
+                )
+                btn.grid(row=row, column=col, sticky="nsew", padx=6, pady=6)
+
+        # Master Submit All to AI Agent Button
+        submit_card = tk.Frame(
+            self.keypad_frame, bg=Palette.BG_CARD, highlightbackground=Palette.ACCENT,
+            highlightthickness=2, padx=12, pady=10
+        )
+        total_rows = ((len(grid_items) - 1) // num_cols) + 1 if grid_items else 0
+        submit_card.grid(row=total_rows + 1, column=0, columnspan=num_cols, sticky="nsew", padx=6, pady=12)
+
+        lbl_sub = tk.Label(
+            submit_card, text="🚀 Complete & Submit All Fields with AI Agent",
+            font=self._fonts["keypad"], fg=Palette.ACCENT, bg=Palette.BG_CARD
+        )
+        lbl_sub.pack(anchor="w", pady=(0, 4))
+
+        def execute_all_inputs_via_agent():
+            items_dict = {}
+            if hasattr(self, '_overlay_form_vars'):
+                for f_name, f_var in self._overlay_form_vars.items():
+                    val = f_var.get().strip()
+                    if val and val not in ("Click to Open Options", "Select option"):
+                        items_dict[f_name] = val
+            if not items_dict:
+                self._log("⚠️ No details filled in overlay fields to submit.")
+                self.voice.speak("Please fill in or select at least one option before submitting.")
+                return
+
+            compound_goal = self.build_form_goal(items_dict)
+            self._log(f"🚀 ReAct Agent Goal: {compound_goal}")
+            self.run_agent_cycle_async(explicit_goal=compound_goal)
+
+        btn_master_submit = tk.Button(
+            submit_card, text="✓ Submit All via ReAct Agent (Accurate Auto-Fill)",
+            font=self._fonts["desc"], bg="#2e7d32", fg="white", activebackground="#1b5e20",
+            relief=tk.FLAT, padx=14, pady=8, cursor="hand2", command=execute_all_inputs_via_agent
+        )
+        btn_master_submit.pack(fill=tk.X, pady=(4, 0))
 
         # Reset scroll position
         self.keypad_canvas.yview_moveto(0)
 
+    # ══════════════════════════════════════════════════════════════════════
+    # Wheelchair Mobile Companion
+    # ══════════════════════════════════════════════════════════════════════
+    def _init_companion_server(self):
+        """Starts the local companion HTTP server and generates the QR code."""
+        try:
+            self._companion_server = CompanionServer(
+                port=8080,
+                on_command=self._on_companion_command,
+                get_state=self.get_companion_state
+            )
+            self._companion_server.start()
+            url = self._companion_server.get_url()
+            self._log(f"♿ Wheelchair companion server active at {url}")
+            self.root.after(200, self._update_companion_qr)
+        except Exception as e:
+            self._log(f"⚠️ Could not start companion server: {e}")
+
+    def _update_companion_qr(self):
+        """Generates a high-contrast QR code image and displays it on the companion banner."""
+        if not self._companion_server:
+            return
+        url = self._companion_server.get_url()
+        try:
+            qr = qrcode.QRCode(
+                version=1,
+                error_correction=qrcode.constants.ERROR_CORRECT_L,
+                box_size=3,
+                border=2,
+            )
+            qr.add_data(url)
+            qr.make(fit=True)
+            qr_img = qr.make_image(fill_color="black", back_color="white")
+            self._companion_qr_img = ImageTk.PhotoImage(qr_img)
+            self.companion_lbl_qr.config(image=self._companion_qr_img)
+            self.companion_url_lbl.config(text=f"Scan to control from your phone:\n{url}")
+        except Exception as e:
+            print(f"[Overlay] Failed generating QR code: {e}")
+
+    def answer_pending_question(self, answer: str) -> bool:
+        """Resolves a pending agent question/clarification from any channel (e.g. mobile companion)."""
+        if not getattr(self, '_pending_question', None):
+            return False
+        pq = self._pending_question
+        ev = pq.get("event")
+        ans_container = pq.get("ans_container")
+        dlg_ref = pq.get("dlg_ref")
+        if ev and not ev.is_set():
+            ans_container.append(answer)
+            self._log(f"📱 Mobile clarification received: '{answer}'")
+            if dlg_ref and dlg_ref[0]:
+                try:
+                    self.root.after(0, lambda: dlg_ref[0].destroy() if dlg_ref[0].winfo_exists() else None)
+                except Exception:
+                    pass
+            ev.set()
+            return True
+        return False
+
+    def get_companion_state(self) -> dict:
+        """Returns the current UI state for the mobile companion (GET /api/state)."""
+        with self._busy_lock:
+            busy = self._is_busy
+
+        pq_data = None
+        if getattr(self, '_pending_question', None):
+            pq = self._pending_question
+            pq_data = {
+                "question": pq.get("question", ""),
+                "type": pq.get("type", "ASK_USER"),
+                "options": pq.get("options") or []
+            }
+
+        targets = getattr(self, '_current_targets', [])
+        classified = classify_targets(targets)
+
+        return {
+            "status": "waiting_user" if pq_data else ("running" if busy else "idle"),
+            "is_busy": busy,
+            "step_info": getattr(self, '_agent_step_status', ""),
+            "pending_question": pq_data,
+            "form": {
+                "inputs": classified["inputs"],
+                "dropdowns": classified["dropdowns"],
+                "toggle_groups": classified["toggle_groups"],
+                "buttons": [b["name"] for b in classified["buttons"] if b.get("name")]
+            }
+        }
+
+    @staticmethod
+    def build_form_goal(items_dict: dict) -> str:
+        """Constructs a deterministic, structured goal for the ReAct browser agent.
+
+        Follows browser-use principles: clear target sequence, autocomplete awareness,
+        and explicit final action.
+        """
+        field_steps = []
+        idx = 1
+        for label, val in items_dict.items():
+            s_val = str(val).strip()
+            if s_val and s_val not in ("Click to Open Options", "Select option"):
+                field_steps.append(f"{idx}. {label}: '{s_val}'")
+                idx += 1
+
+        if not field_steps:
+            return ""
+
+        prompt = (
+            "Sequentially and accurately fill the following form fields on the webpage:\n"
+            + "\n".join(field_steps) + "\n\n"
+            "Rules for execution:\n"
+            "- For city, airport, or station inputs: click the field, type the city name, wait for the dropdown autocomplete list to appear, and click the matching suggestion item from the list.\n"
+            "- For date pickers: select the specified date.\n"
+            "- For buttons or tabs (like Trip Type): click the requested option.\n"
+            "- Do not click submit until all listed fields are filled.\n"
+            "- Once all fields are accurately selected, click the search/submit button to proceed."
+        )
+        return prompt
+
+    def _on_companion_command(self, cmd: dict) -> tuple[int, dict]:
+        """Dispatches commands sent from the mobile companion to the kiosk agent."""
+        action = cmd.get("action")
+        self._log(f"📱 Mobile Companion Command: {cmd}")
+        self.voice.play_earcon("listening")
+
+        # 1. Answering a pending question
+        if action == "answer":
+            ans = cmd.get("answer", "").strip()
+            if not ans:
+                return (400, {"status": "error", "message": "Answer cannot be empty."})
+            success = self.answer_pending_question(ans)
+            if success:
+                return (200, {"status": "ok", "message": f"Answer recorded: {ans}"})
+            else:
+                return (404, {"status": "not_found", "message": "No pending question to answer."})
+
+        # 2. Voice instruction: if a question is pending, treat voice input as the answer!
+        if action == "voice":
+            text = cmd.get("text", "").strip()
+            if not text:
+                return (400, {"status": "error", "message": "Voice instruction is empty."})
+            if getattr(self, '_pending_question', None):
+                self.answer_pending_question(text)
+                return (200, {"status": "ok", "message": f"Answer recorded via voice: {text}"})
+
+            with self._busy_lock:
+                if self._is_busy:
+                    self._log("📱 Mobile Command received but kiosk is busy.")
+                    return (409, {"status": "busy", "message": "Kiosk is currently performing a task. Please wait a moment."})
+
+            self.root.after(0, lambda: self.run_agent_cycle_async(explicit_goal=text))
+            return (200, {"status": "ok", "message": f"Executing: {text}"})
+
+        # 3. Screen scan request
+        if action == "scan":
+            with self._busy_lock:
+                if self._is_busy:
+                    return (409, {"status": "busy", "message": "Kiosk is currently performing a task. Please wait."})
+            self.root.after(0, lambda: self.run_cycle_async(pre_transcribed_text="Scan all fields on this screen."))
+            return (200, {"status": "ok", "message": "Scanning screen elements..."})
+
+        # 4. Form submission (dynamic form or quick flight form)
+        if action in ("submit", "submit_form"):
+            with self._busy_lock:
+                if self._is_busy:
+                    return (409, {"status": "busy", "message": "Kiosk is currently performing a task. Please wait."})
+
+            if action == "submit_form":
+                fields_dict = cmd.get("fields", {})
+            else:
+                trip_type = cmd.get("trip_type", "One Way")
+                from_loc = cmd.get("from", "").strip()
+                to_loc = cmd.get("to", "").strip()
+                date_val = cmd.get("date", "").strip()
+                fields_dict = {}
+                if trip_type: fields_dict["Trip Type"] = trip_type
+                if from_loc: fields_dict["From / Origin"] = from_loc
+                if to_loc: fields_dict["To / Destination"] = to_loc
+                if date_val: fields_dict["Departure Date"] = date_val
+
+            # Mirror to on-screen overlay form fields if present (on Tk main thread)
+            def _mirror_to_overlay():
+                if hasattr(self, '_overlay_form_vars'):
+                    for f_name, f_val in fields_dict.items():
+                        if f_name in self._overlay_form_vars:
+                            self._overlay_form_vars[f_name].set(str(f_val))
+                        else:
+                            for k, v in self._overlay_form_vars.items():
+                                if f_name.lower() in k.lower() or k.lower() in f_name.lower():
+                                    v.set(str(f_val))
+
+            self.root.after(0, _mirror_to_overlay)
+
+            goal = self.build_form_goal(fields_dict)
+            if not goal:
+                return (400, {"status": "error", "message": "No fields specified."})
+
+            self.root.after(0, lambda: self.run_agent_cycle_async(explicit_goal=goal))
+            return (200, {"status": "ok", "message": "Form submitted to ReAct agent."})
+
+        return (400, {"status": "error", "message": f"Unknown action: {action}"})
+
+    def _auto_start_wake_word(self):
+        """Automatically starts the background wake word listener for hands-free blind access."""
+        if self._wake_word_enabled.get() and not self._wake_stop_fn:
+            self._log("🎙️ Access word listener active (Listening for 'access' / 'hey access')")
+            self._wake_stop_fn = self.voice.listen_continuous("access", self._on_wake_word)
+
     def _toggle_wake_word(self):
         if self._wake_word_enabled.get():
-            self._log("🎙️ Wake word enabled (Listening for 'access')")
+            self._log("🎙️ Access word listener enabled (Listening for 'access')")
             self._wake_stop_fn = self.voice.listen_continuous("access", self._on_wake_word)
         else:
             if self._wake_stop_fn:
-                self._log("🎙️ Wake word disabled")
+                self._log("🎙️ Access word listener paused")
                 self._wake_stop_fn(wait_for_stop=False)
                 self._wake_stop_fn = None
 
     def _on_wake_word(self, clean_text):
+        with self._busy_lock:
+            if self._is_busy:
+                return
         if self.btn_listen.cget("state") != tk.DISABLED:
             self.run_cycle_async(pre_transcribed_text=clean_text)
 
@@ -1017,10 +1590,20 @@ class OverlayApp:
     # ══════════════════════════════════════════════════════════════════════
     def run_cycle_async(self, pre_transcribed_text: str = None):
         """Dispatches the vision/voice cycle to a background thread."""
+        with self._busy_lock:
+            if self._is_busy:
+                self._log("⚠️ Task ignored: kiosk is currently busy.")
+                return
         self.root.after(0, self.btn_listen.config, {"state": tk.DISABLED})
         threading.Thread(target=self.run_cycle, args=(pre_transcribed_text,), daemon=True).start()
 
     def run_cycle(self, pre_transcribed_text: str = None):
+        with self._busy_lock:
+            if self._is_busy:
+                self._log("⚠️ Task ignored: kiosk is currently busy.")
+                return
+            self._is_busy = True
+
         self._cycle_had_error = False
         self._last_cycle_time = time.time()
         if hasattr(self, '_proactive'):
@@ -1029,24 +1612,32 @@ class OverlayApp:
             # --- Step 1: Voice Input ---
             self.root.after(0, self.btn_listen.config, {"state": tk.DISABLED})
             
-            if pre_transcribed_text:
-                self._log(f"🎤 Wake word triggered! Pre-transcribed: {pre_transcribed_text}")
+            if pre_transcribed_text and pre_transcribed_text.strip():
+                self._log(f"🎤 Access word triggered with command: \"{pre_transcribed_text}\"")
                 user_input = pre_transcribed_text
-                if not user_input.strip():
-                    user_input = "Please help me with this screen." # fallback if they just said "access"
             else:
-                self._set_voice_status("Listening…", Palette.WARNING)
-                self._log("🎤 Listening for voice input…")
+                if pre_transcribed_text is not None:
+                    # User said "access" without a trailing command - actively listen for their command!
+                    self._log("🎤 Access word detected! Listening for your command…")
+                    self._set_voice_status("Listening for command…", Palette.WARNING)
+                else:
+                    self._set_voice_status("Listening…", Palette.WARNING)
+                    self._log("🎤 Listening for voice input…")
 
-                user_input, voice_error = self._listen_for_reply(timeout=7)
+                user_input, voice_error = self._listen_for_reply(timeout=8)
 
                 if not user_input:
-                    error_msg = voice_error or "No speech detected"
-                    self._set_voice_status(f"⚠ {error_msg}", Palette.WARNING)
-                    self._set_engine_status("Idle", Palette.SUCCESS)
-                    self._log(f"⚠ {error_msg}")
-                    self._play_error_sound()
-                    return
+                    if pre_transcribed_text is not None:
+                        # Fallback if they said "access" but remained silent
+                        user_input = "Please help me with this screen."
+                        self._log("ℹ No follow-up command spoken — defaulting to screen assistance.")
+                    else:
+                        error_msg = voice_error or "No speech detected"
+                        self._set_voice_status(f"⚠ {error_msg}", Palette.WARNING)
+                        self._set_engine_status("Idle", Palette.SUCCESS)
+                        self._log(f"⚠ {error_msg}")
+                        self._play_error_sound()
+                        return
 
             self._set_voice_status("Transcribed ✓", Palette.SUCCESS)
             self._set_transcript(user_input)
@@ -1231,7 +1822,7 @@ class OverlayApp:
                                 self._log(f"Typing -> '{type_text}'")
                                 inject_keys(["ctrl+a", "backspace"])
                                 time.sleep(0.2)
-                                inject_text(type_text)
+                                inject_text(type_text, press_enter=True)
                                 time.sleep(0.3)
 
                     keys_to_press = target.get("press_keys")
@@ -1356,6 +1947,8 @@ class OverlayApp:
             # Record failure for escalation tracking
             self._escalation.record_failure(str(exc))
         finally:
+            with self._busy_lock:
+                self._is_busy = False
             self._is_processing = False
             if not self._cycle_had_error:
                 self._set_voice_status("Ready", Palette.SUCCESS)
@@ -1374,27 +1967,42 @@ class OverlayApp:
     # ══════════════════════════════════════════════════════════════════════
     # Stateful Agent Loop (Phase 1 Upgrade)
     # ══════════════════════════════════════════════════════════════════════
-    def run_agent_cycle_async(self):
+    def run_agent_cycle_async(self, explicit_goal: str = None):
         """Dispatches the stateful agent loop to a background thread."""
+        with self._busy_lock:
+            if self._is_busy:
+                self._log("⚠️ Agent task ignored: kiosk is currently busy.")
+                return
         self.root.after(0, self.btn_agent.config, {"state": tk.DISABLED})
         self.root.after(0, self.btn_listen.config, {"state": tk.DISABLED})
-        threading.Thread(target=self.run_agent_cycle, daemon=True).start()
+        threading.Thread(target=self.run_agent_cycle, args=(explicit_goal,), daemon=True).start()
 
-    def run_agent_cycle(self):
+    def run_agent_cycle(self, explicit_goal: str = None):
+        with self._busy_lock:
+            if self._is_busy:
+                self._log("⚠️ Agent task ignored: kiosk is currently busy.")
+                return
+            self._is_busy = True
+
         self._cycle_had_error = False
         self._last_cycle_time = time.time()
         if hasattr(self, '_proactive'):
             self._proactive.record_cycle()
             
-        typed_goal = self.agent_input.get().strip()
-        if typed_goal:
-            user_goal = typed_goal
-            self.agent_input.delete(0, tk.END)
-            self._log(f"📝 Text input used: {user_goal}")
-            self._set_voice_status("Text Input ✓", Palette.SUCCESS)
+        if explicit_goal:
+            user_goal = explicit_goal
+            self._log(f"🎯 Form Submitted Goal: {user_goal}")
+            self._set_voice_status("Goal Ready ✓", Palette.SUCCESS)
         else:
-            self._set_voice_status("Listening…", Palette.WARNING)
-            user_goal, err = self._listen_for_reply(timeout=10)
+            typed_goal = self.agent_input.get().strip()
+            if typed_goal:
+                user_goal = typed_goal
+                self.agent_input.delete(0, tk.END)
+                self._log(f"📝 Text input used: {user_goal}")
+                self._set_voice_status("Text Input ✓", Palette.SUCCESS)
+            else:
+                self._set_voice_status("Listening…", Palette.WARNING)
+                user_goal, err = self._listen_for_reply(timeout=10)
             
             if not user_goal:
                 error_msg = err or "No speech detected"
@@ -1415,152 +2023,245 @@ class OverlayApp:
         history = []
         max_steps = 30
         step = 0
-        
-        while step < max_steps:
-            step += 1
-            if hasattr(self, '_proactive'):
-                self._proactive.record_cycle()
-                
-            self._log(f"--- Agent Step {step} ---")
-            self._set_engine_status(f"Step {step}: Capturing…", Palette.WARNING)
-            
-            wait_for_stable_screen(timeout=2.0, interval=0.25)
-            screenshot, monitor_info = capture_screen(hide_window=self.root)
-            
-            self._set_engine_status(f"Step {step}: Analysing…", Palette.WARNING)
-            action_data = analyze_agent_step(screenshot, user_goal, history)
-            
-            if not action_data:
-                self._log("Agent failed to respond. Aborting loop.")
-                self.voice.speak("I encountered an error planning the next step.")
-                break
-                
-            action_type = action_data.get("action_type")
-            thought = action_data.get("thought_process")
-            speech = action_data.get("speech_to_user")
-            
-            self._log(f"🤔 Thought: {thought}")
-            if speech:
-                self.voice.speak(speech)
-                
-            if action_type == "DONE":
-                self._log("✅ Goal Achieved!")
-                self._play_success_sound()
-                break
-            elif action_type == "ERROR":
-                self._log(f"❌ Agent Error: {action_data.get('error_reason')}")
-                self._play_error_sound()
-                break
-            elif action_type in ["ASK_USER", "READ_OPTIONS"]:
-                if action_type == "READ_OPTIONS":
-                    self._log(f"📖 Agent reading options: {speech}")
-                else:
-                    self._log(f"❓ Agent asked: {speech}")
-                
-                # Thread-safe dialog using an Event
-                ans_container = []
-                ev = threading.Event()
-                def _ask():
-                    # Custom dialog to guarantee it appears on top and doesn't freeze invisibly
-                    dlg = tk.Toplevel(self.root)
-                    dlg.title("Agent Needs Info")
-                    dlg.attributes("-topmost", True)
-                    # Auto-size height based on text length by omitting the height parameter
-                    dlg.geometry(f"300x250+{self.root.winfo_x() - 50}+{self.root.winfo_y() + 100}")
-                    dlg.configure(bg=Palette.BG_CARD)
-                    
-                    tk.Label(dlg, text=speech, font=self._fonts["status"], bg=Palette.BG_CARD, fg=Palette.TEXT, wraplength=280).pack(pady=10)
-                    ans_entry = tk.Entry(dlg, font=self._fonts["indicator"], bg=Palette.BG_INPUT, fg=Palette.TEXT, insertbackground=Palette.TEXT)
-                    ans_entry.pack(fill=tk.X, padx=15, pady=5)
-                    ans_entry.focus_set()
-                    
-                    def _on_submit(*args):
-                        ans_container.append(ans_entry.get().strip())
-                        dlg.destroy()
-                        ev.set()
-                        
-                    ans_entry.bind("<Return>", _on_submit)
-                    tk.Button(dlg, text="Submit", command=_on_submit, bg=Palette.ACCENT_DIM, fg="white", relief=tk.FLAT).pack(pady=10)
-                    
-                    # If user closes window with X
-                    def _on_close():
-                        ans_container.append(None)
-                        dlg.destroy()
-                        ev.set()
-                    dlg.protocol("WM_DELETE_WINDOW", _on_close)
 
-                self.root.after(0, _ask)
-                ev.wait()
-                
-                user_reply = ans_container[0] if ans_container else None
-                if user_reply:
-                    user_goal = f"{user_goal}. [User clarified: {user_reply}]"
-                    self._log(f"📝 Goal updated to: {user_goal}")
-                    self._set_transcript(f"Goal: {user_goal}")
-                    history.append(f"Turn {step}: Asked user '{speech}', user replied '{user_reply}'")
-                else:
-                    self._log("❌ User cancelled the clarification dialog. Aborting loop.")
-                    break
-                continue # Restart loop with new goal
-                
-            self._set_engine_status(f"Step {step}: Executing {action_type}…", Palette.WARNING)
-            
-            box = action_data.get("target_box_2d")
-            if box and (len(box) == 4 or len(box) == 2):
-                if len(box) == 4:
-                    ymin, xmin, ymax, xmax = [float(v) for v in box]
-                    center_x = ((xmin + xmax) / 2) / 1000.0
-                    center_y = ((ymin + ymax) / 2) / 1000.0
-                elif len(box) == 2:
-                    center_y = float(box[0]) / 1000.0
-                    center_x = float(box[1]) / 1000.0
-                else:
-                    continue
-                
-                if action_type in ["CLICK", "TYPE"]:
-                    self._log(f"🖱️ Clicking at ({center_x:.2f}, {center_y:.2f})")
-                    inject_click(center_x, center_y, monitor_info, self.root)
+        # If currently in fullscreen mode, temporarily dock the overlay to the side
+        # so the underlying browser is fully visible and receives OS focus for typing and clicks
+        was_in_fullscreen = self._is_fullscreen
+        if was_in_fullscreen:
+            def _switch_to_docked():
+                self._is_fullscreen = False
+                self.fullscreen_btn.config(text="⛶ Fullscreen Facade", bg=Palette.ACCENT_DIM)
+                self._update_window_geometry()
+                self._log("❐ Auto-docked to side-panel during ReAct agent execution")
+            self.root.after(0, _switch_to_docked)
+            time.sleep(0.3)
+
+        try:
+            while step < max_steps:
+                step += 1
+                if hasattr(self, '_proactive'):
+                    self._proactive.record_cycle()
                     
-                if action_type == "TYPE":
-                    type_text = action_data.get("type_text")
-                    if type_text:
-                        self._log(f"⌨️ Typing: '{type_text}'")
-                        inject_text(type_text)
+                self._log(f"--- Agent Step {step} ---")
+                self._agent_step_status = f"Step {step}/{max_steps}: Capturing and analyzing screen..."
+                self._set_engine_status(f"Step {step}: Capturing…", Palette.WARNING)
+                
+                wait_for_stable_screen(timeout=2.0, interval=0.25)
+                screenshot, monitor_info = capture_screen(hide_window=self.root)
+                
+                self._set_engine_status(f"Step {step}: Analysing…", Palette.WARNING)
+                action_data = analyze_agent_step(screenshot, user_goal, history)
+                
+                if not action_data:
+                    self._log("Agent failed to respond. Aborting loop.")
+                    self.voice.speak("I encountered an error planning the next step.")
+                    break
+                    
+                action_type = action_data.get("action_type")
+                thought = action_data.get("thought_process")
+                speech = action_data.get("speech_to_user")
+                evaluation = action_data.get("evaluation_previous_action")
+                task_memory = action_data.get("task_memory")
+
+                if evaluation:
+                    self._log(f"🔍 Eval: {evaluation}")
+                if task_memory and isinstance(task_memory, dict):
+                    comp = task_memory.get("completed")
+                    if comp and isinstance(comp, list) and len(comp) > 0:
+                        self._log(f"📋 Progress: {', '.join(comp)}")
+
+                self._log(f"🤔 Thought: {thought}")
+                if speech:
+                    self.voice.speak(speech)
+                    
+                if action_type == "DONE":
+                    self._agent_step_status = f"Completed: {speech or 'Goal achieved'}"
+                    self._log("✅ Goal Achieved!")
+                    self._play_success_sound()
+                    break
+                elif action_type == "ERROR":
+                    self._agent_step_status = f"Error: {action_data.get('error_reason', 'Task aborted')}"
+                    self._log(f"❌ Agent Error: {action_data.get('error_reason')}")
+                    self._play_error_sound()
+                    break
+                elif action_type in ["ASK_USER", "READ_OPTIONS"]:
+                    if action_type == "READ_OPTIONS":
+                        self._log(f"📖 Agent reading options: {speech}")
+                    else:
+                        self._log(f"❓ Agent asked: {speech}")
+                    
+                    options_list = action_data.get("options") or []
+                    self._agent_step_status = f"Waiting for your choice: {speech}"
+
+                    # Thread-safe dialog using an Event
+                    ans_container = []
+                    ev = threading.Event()
+                    dlg_ref = [None]
+
+                    self._pending_question = {
+                        "question": speech,
+                        "type": action_type,
+                        "options": options_list,
+                        "event": ev,
+                        "ans_container": ans_container,
+                        "dlg_ref": dlg_ref
+                    }
+
+                    def _ask():
+                        dlg = tk.Toplevel(self.root)
+                        dlg_ref[0] = dlg
+                        dlg.title("Agent Needs Info")
+                        dlg.attributes("-topmost", True)
+                        dlg.geometry(f"320x260+{self.root.winfo_x() - 50}+{self.root.winfo_y() + 100}")
+                        dlg.configure(bg=Palette.BG_CARD)
                         
-            elif action_type == "SCROLL_DOWN":
-                inject_scroll("down")
-            elif action_type == "SCROLL_UP":
-                inject_scroll("up")
+                        tk.Label(dlg, text=speech, font=self._fonts["status"], bg=Palette.BG_CARD, fg=Palette.TEXT, wraplength=300).pack(pady=10)
+                        ans_entry = tk.Entry(dlg, font=self._fonts["indicator"], bg=Palette.BG_INPUT, fg=Palette.TEXT, insertbackground=Palette.TEXT)
+                        ans_entry.pack(fill=tk.X, padx=15, pady=5)
+                        ans_entry.focus_set()
+                        
+                        def _on_submit(*args):
+                            val = ans_entry.get().strip()
+                            if not ev.is_set():
+                                ans_container.append(val)
+                                try: dlg.destroy()
+                                except Exception: pass
+                                ev.set()
+                            
+                        ans_entry.bind("<Return>", _on_submit)
+                        tk.Button(dlg, text="Submit", command=_on_submit, bg=Palette.ACCENT_DIM, fg="white", relief=tk.FLAT).pack(pady=10)
+                        
+                        def _on_close():
+                            if not ev.is_set():
+                                ans_container.append(None)
+                                try: dlg.destroy()
+                                except Exception: pass
+                                ev.set()
+                        dlg.protocol("WM_DELETE_WINDOW", _on_close)
+
+                    self.root.after(0, _ask)
+                    
+                    # Also listen for a spoken voice reply concurrently for blind/motor accessibility
+                    def _listen_async():
+                        time.sleep(0.5)
+                        spoken_text, _ = self._listen_for_reply(timeout=12)
+                        if spoken_text and not ev.is_set():
+                            ans_container.append(spoken_text)
+                            self._log(f"🎙️ Spoken clarification: '{spoken_text}'")
+                            if dlg_ref[0]:
+                                self.root.after(0, lambda: dlg_ref[0].destroy() if dlg_ref[0].winfo_exists() else None)
+                            ev.set()
+
+                    listen_thread = threading.Thread(target=_listen_async, daemon=True)
+                    listen_thread.start()
+
+                    ev.wait(timeout=35)
+                    self._pending_question = None
+                    
+                    user_reply = ans_container[0] if ans_container else None
+                    if user_reply:
+                        user_goal = f"{user_goal}. [User clarified preference: {user_reply}]"
+                        self._log(f"📝 Goal updated with clarification: {user_goal}")
+                        self._set_transcript(f"Goal: {user_goal}")
+                        history.append(f"Turn {step}: Clarified '{speech}', user chose '{user_reply}'")
+                    else:
+                        self._log("❌ No clarification received. Aborting loop.")
+                        break
+                    continue # Restart loop with updated clarification
+                    
+                if action_type == "CLICK":
+                    self._agent_step_status = f"Step {step}: Clicking {action_data.get('target_name', 'element')}..."
+                elif action_type == "TYPE":
+                    self._agent_step_status = f"Step {step}: Typing '{action_data.get('type_text', '')}' into {action_data.get('target_name', 'field')}..."
+                elif action_type in ("SCROLL_DOWN", "SCROLL_UP"):
+                    self._agent_step_status = f"Step {step}: Scrolling {action_type.split('_')[-1].lower()}..."
+
+                self._set_engine_status(f"Step {step}: Executing {action_type}…", Palette.WARNING)
                 
-            keys_to_press = action_data.get("press_keys")
-            if keys_to_press and isinstance(keys_to_press, list):
-                inject_keys(keys_to_press)
+                box = action_data.get("target_box_2d")
+                if box and (len(box) == 4 or len(box) == 2):
+                    if len(box) == 4:
+                        ymin, xmin, ymax, xmax = [float(v) for v in box]
+                        center_x = ((xmin + xmax) / 2) / 1000.0
+                        center_y = ((ymin + ymax) / 2) / 1000.0
+                    elif len(box) == 2:
+                        center_y = float(box[0]) / 1000.0
+                        center_x = float(box[1]) / 1000.0
+                    else:
+                        continue
+                    
+                    was_occluded = False
+                    if action_type in ["CLICK", "TYPE"]:
+                        self._log(f"🖱️ Clicking at ({center_x:.2f}, {center_y:.2f})")
+                        # For TYPE, delay restoring overlay until after typing is finished so overlay doesn't steal focus
+                        restore_now = (action_type != "TYPE")
+                        was_occluded = inject_click(center_x, center_y, monitor_info, self.root, restore_overlay=restore_now)
+                        time.sleep(0.12)
+                        
+                    if action_type == "TYPE":
+                        type_text = action_data.get("type_text")
+                        if type_text:
+                            self._log(f"⌨️ Typing (atomic, no enter): '{type_text}'")
+                            inject_text(type_text, press_enter=False)
+                            time.sleep(0.15)
+                        if was_occluded:
+                            try:
+                                self.root.deiconify()
+                                self.root.update()
+                            except Exception:
+                                pass
+                            
+                elif action_type == "SCROLL_DOWN":
+                    inject_scroll("down")
+                elif action_type == "SCROLL_UP":
+                    inject_scroll("up")
+                    
+                keys_to_press = action_data.get("press_keys")
+                if keys_to_press and isinstance(keys_to_press, list):
+                    inject_keys(keys_to_press)
+                    
+                # Build detailed history string
+                hist_str = f"Turn {step}: {action_type}"
+                if action_type == "TYPE" and action_data.get("type_text"):
+                    hist_str += f" '{action_data['type_text']}' into {action_data.get('target_name', 'field')}"
+                elif action_type == "CLICK":
+                    hist_str += f" on {action_data.get('target_name', 'element')}"
+                if keys_to_press:
+                    hist_str += f", then pressed {keys_to_press}"
+                if evaluation:
+                    hist_str += f" -> [Eval: {evaluation}]"
+                history.append(hist_str)
+                time.sleep(1.0)
                 
-            # Build detailed history string
-            hist_str = f"Turn {step}: {action_type}"
-            if action_type == "TYPE" and action_data.get("type_text"):
-                hist_str += f" '{action_data['type_text']}' into {action_data.get('target_name', 'field')}"
-            elif action_type == "CLICK":
-                hist_str += f" on {action_data.get('target_name', 'element')}"
-            if keys_to_press:
-                hist_str += f", then pressed {keys_to_press}"
-            history.append(hist_str)
-            time.sleep(1.0)
-            
-        if step >= max_steps:
-            self._log("⚠ Max steps reached. Aborting to prevent infinite loop.")
-            self.voice.speak("I've reached the maximum number of steps for this task.")
-            
-        self._set_engine_status("Idle", Palette.SUCCESS)
-        self.root.after(0, self.btn_agent.config, {"state": tk.NORMAL})
-        self.root.after(0, self.btn_listen.config, {"state": tk.NORMAL})
-        self._log("── Agent Cycle Complete ──")
+            if step >= max_steps:
+                self._log("⚠ Max steps reached. Aborting to prevent infinite loop.")
+                self.voice.speak("I've reached the maximum number of steps for this task.")
+        finally:
+            self._pending_question = None
+            self._agent_step_status = ""
+            with self._busy_lock:
+                self._is_busy = False
+            self._set_engine_status("Idle", Palette.SUCCESS)
+            self.root.after(0, self.btn_agent.config, {"state": tk.NORMAL})
+            self.root.after(0, self.btn_listen.config, {"state": tk.NORMAL})
+            self._log("── Agent Cycle Complete ──")
+            if was_in_fullscreen:
+                def _restore_fullscreen():
+                    self._is_fullscreen = True
+                    self.fullscreen_btn.config(text="❐ Docked Panel", bg="#388e3c")
+                    self._update_window_geometry()
+                    self._log("⛶ Restored to Full-Screen Facade Mode")
+                    # Re-scan newly loaded page elements
+                    self.root.after(1000, lambda: self.run_cycle_async(pre_transcribed_text="Scan and read the screen elements"))
+                self.root.after(1500, _restore_fullscreen)
 
     # ══════════════════════════════════════════════════════════════════════
     # Shutdown
     # ══════════════════════════════════════════════════════════════════════
     def on_closing(self):
         self.running = False
+        if self._companion_server:
+            self._companion_server.stop()
         if self._wake_stop_fn:
             self._wake_stop_fn(wait_for_stop=False)
         if hasattr(self, '_proactive'):
